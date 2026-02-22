@@ -1,0 +1,70 @@
+.DS_Store
+/.build
+/Packages
+xcuserdata/
+DerivedData/
+.swiftpm/configuration/registries.json
+.swiftpm/xcode/package.xcworkspace/contents.xcworkspacedata
+.netrc
+
+# macOS 시스템 파일
+.DS_Store
+**/.DS_Store
+
+# Xcode
+xcuserdata/
+*.xccheckout
+profile
+*.moved-aside
+DerivedData/
+*.xcworkspace
+*.xcscmblueprint
+build/
+*.pbxuser
+*.mode1v3
+*.mode2v3
+*.perspectivev3
+*.hmap
+
+# App packaging
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# Swift Package Manager
+Package.resolved
+**/.build
+**/.swiftpm
+.build/
+
+# Mint package manager
+Mint
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info
+.pytest_cache
+.ipynb_checkpoints
+
+# Temporary files
+*.tmp
+*.temp
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+xcodebuild.log
+
+# System files
+Thumbs.db
+
+# CLI Tool
+**/GoogleService-Info.plist
+*.xcconfig
