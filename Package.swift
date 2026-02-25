@@ -39,5 +39,10 @@ let package = Package(
             dependencies: ["HangulSearch"],
             path: "Tests/HangulSearchTests"
         ),
+        .testTarget(
+            name: "HangulSearchableTests",
+            dependencies: ["HangulSearchable", "HangulSearch"],
+            path: "Tests/HangulSearchableTests"
+        ),
     ]
 )

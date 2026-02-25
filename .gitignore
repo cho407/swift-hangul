@@ -68,3 +68,25 @@ Thumbs.db
 # CLI Tool
 **/GoogleService-Info.plist
 *.xcconfig
+
+# Secrets and local credentials
+.env
+.env.*
+!.env.example
+!.env.sample
+*.pem
+*.key
+*.p8
+*.p12
+*.mobileprovision
+*.cer
+*.der
+*.jks
+*.keystore
+*.kdbx
+**/secrets.json
+**/Secrets.plist
+**/credentials.json
+*.db
+*.sqlite
+*.sqlite3
