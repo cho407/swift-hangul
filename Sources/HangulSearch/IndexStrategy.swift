@@ -24,6 +24,7 @@ public struct SearchPolicy: Sendable {
     public var lazyWarmup: LazyWarmupPolicy
     public var maxQueryLength: Int?
     public var maxCandidateScan: Int?
+    public var maxCachedResultCount: Int?
 
     public static let `default` = SearchPolicy(
         choseongOptions: .default,
@@ -31,7 +32,8 @@ public struct SearchPolicy: Sendable {
         cache: .none,
         lazyWarmup: .none,
         maxQueryLength: 256,
-        maxCandidateScan: nil
+        maxCandidateScan: nil,
+        maxCachedResultCount: 1_024
     )
 
     public init(
@@ -40,7 +42,8 @@ public struct SearchPolicy: Sendable {
         cache: CachePolicy = .none,
         lazyWarmup: LazyWarmupPolicy = .none,
         maxQueryLength: Int? = 256,
-        maxCandidateScan: Int? = nil
+        maxCandidateScan: Int? = nil,
+        maxCachedResultCount: Int? = 1_024
     ) {
         self.choseongOptions = choseongOptions
         self.indexStrategy = indexStrategy
@@ -55,6 +58,11 @@ public struct SearchPolicy: Sendable {
             self.maxCandidateScan = max(1, maxCandidateScan)
         } else {
             self.maxCandidateScan = nil
+        }
+        if let maxCachedResultCount {
+            self.maxCachedResultCount = max(1, maxCachedResultCount)
+        } else {
+            self.maxCachedResultCount = nil
         }
     }
 }
@@ -72,7 +80,20 @@ public enum MatchMode: String, Sendable {
         case .prefix:
             return text.hasPrefix(query)
         case .exact:
-            return text == query
+            return Self.matchesExact(text: text, query: query)
         }
+    }
+
+    @inlinable
+    static func matchesExact(text: String, query: String) -> Bool {
+        if text == query { return true }
+        if query.isEmpty { return false }
+
+        for token in text.split(whereSeparator: { !$0.isLetter && !$0.isNumber }) {
+            if token == query {
+                return true
+            }
+        }
+        return false
     }
 }

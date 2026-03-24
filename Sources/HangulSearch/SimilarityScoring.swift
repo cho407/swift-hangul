@@ -338,7 +338,15 @@ enum SimilarityScorer {
     }
 
     private static func canonical(_ text: String) -> String {
-        text.precomposedStringWithCanonicalMapping.lowercased()
+        let normalized = text.precomposedStringWithCanonicalMapping.lowercased()
+        var scalars: [UnicodeScalar] = []
+        scalars.reserveCapacity(normalized.unicodeScalars.count)
+
+        for scalar in normalized.unicodeScalars where !scalar.properties.isWhitespace {
+            scalars.append(scalar)
+        }
+
+        return String(String.UnicodeScalarView(scalars))
     }
 
     private static func jamoStats(_ lhs: String, _ rhs: String) -> (queryJamo: String, targetJamo: String, distance: Int, similarity: Double) {

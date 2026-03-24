@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 public struct SimilarityQueryEvent: Codable, Sendable, Equatable {
     public enum Outcome: String, Codable, Sendable {
@@ -32,16 +33,38 @@ public struct SimilarityQueryEvent: Codable, Sendable, Equatable {
 public struct SimilarityFeedbackStoreOptions: Sendable, Equatable {
     public var maxEvents: Int
     public var ttl: TimeInterval
+    public var storageRedaction: SimilarityFeedbackRedaction
+    public var outputRedaction: SimilarityFeedbackRedaction
+    public var redactionSalt: String
 
     public static let `default` = SimilarityFeedbackStoreOptions(
         maxEvents: 10_000,
-        ttl: 60 * 60 * 24 * 30
+        ttl: 60 * 60 * 24 * 30,
+        storageRedaction: .none,
+        outputRedaction: .hashQuery,
+        redactionSalt: "swift-hangul-feedback"
     )
 
-    public init(maxEvents: Int = 10_000, ttl: TimeInterval = 60 * 60 * 24 * 30) {
+    public init(
+        maxEvents: Int = 10_000,
+        ttl: TimeInterval = 60 * 60 * 24 * 30,
+        storageRedaction: SimilarityFeedbackRedaction = .none,
+        outputRedaction: SimilarityFeedbackRedaction = .hashQuery,
+        redactionSalt: String = "swift-hangul-feedback"
+    ) {
         self.maxEvents = max(1, maxEvents)
         self.ttl = max(60, ttl)
+        self.storageRedaction = storageRedaction
+        self.outputRedaction = outputRedaction
+        let normalizedSalt = redactionSalt.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.redactionSalt = normalizedSalt.isEmpty ? "swift-hangul-feedback" : normalizedSalt
     }
+}
+
+public enum SimilarityFeedbackRedaction: String, Codable, Sendable, Equatable {
+    case none
+    case hashQuery
+    case hashQueryAndSelection
 }
 
 public struct SimilarityFeedbackPairStat: Codable, Sendable, Equatable {
@@ -85,29 +108,34 @@ public struct SimilarityFeedbackSummary: Codable, Sendable, Equatable {
 
 public actor SimilarityFeedbackStore {
     private let options: SimilarityFeedbackStoreOptions
+    private let redactionKey: SymmetricKey
     private var events: [SimilarityQueryEvent] = []
     private var droppedByTTL = 0
     private var droppedByCapacity = 0
 
     public init(options: SimilarityFeedbackStoreOptions = .default) {
         self.options = options
+        self.redactionKey = SymmetricKey(data: Data(options.redactionSalt.utf8))
         self.events.reserveCapacity(min(options.maxEvents, 2_048))
     }
 
     public func record(_ event: SimilarityQueryEvent, now: Date = Date()) {
-        events.append(event)
+        events.append(applyRedaction(to: event, mode: options.storageRedaction))
         prune(now: now)
     }
 
     public func record(_ newEvents: [SimilarityQueryEvent], now: Date = Date()) {
         guard !newEvents.isEmpty else { return }
-        events.append(contentsOf: newEvents)
+        events.append(contentsOf: newEvents.map { applyRedaction(to: $0, mode: options.storageRedaction) })
         prune(now: now)
     }
 
-    public func snapshot(now: Date = Date()) -> [SimilarityQueryEvent] {
+    public func snapshot(
+        now: Date = Date(),
+        redaction: SimilarityFeedbackRedaction? = nil
+    ) -> [SimilarityQueryEvent] {
         prune(now: now)
-        return events
+        return redactedEvents(events, mode: redaction ?? options.outputRedaction)
     }
 
     public func trainingSamples(
@@ -123,13 +151,18 @@ public actor SimilarityFeedbackStore {
         )
     }
 
-    public func summary(now: Date = Date(), maxPairs: Int = 200) -> SimilarityFeedbackSummary {
+    public func summary(
+        now: Date = Date(),
+        maxPairs: Int = 200,
+        redaction: SimilarityFeedbackRedaction? = nil
+    ) -> SimilarityFeedbackSummary {
         prune(now: now)
-        let topPairs = Self.buildPairStats(events: events, maxPairs: maxPairs)
-        let uniqueQueries = Set(events.map(\.query)).count
+        let exportedEvents = redactedEvents(events, mode: redaction ?? options.outputRedaction)
+        let topPairs = Self.buildPairStats(events: exportedEvents, maxPairs: maxPairs)
+        let uniqueQueries = Set(exportedEvents.map(\.query)).count
         return SimilarityFeedbackSummary(
             generatedAt: now,
-            totalEvents: events.count,
+            totalEvents: exportedEvents.count,
             uniqueQueries: uniqueQueries,
             droppedByTTL: droppedByTTL,
             droppedByCapacity: droppedByCapacity,
@@ -137,8 +170,12 @@ public actor SimilarityFeedbackStore {
         )
     }
 
-    public func summaryJSON(now: Date = Date(), maxPairs: Int = 200) throws -> Data {
-        let summary = summary(now: now, maxPairs: maxPairs)
+    public func summaryJSON(
+        now: Date = Date(),
+        maxPairs: Int = 200,
+        redaction: SimilarityFeedbackRedaction? = nil
+    ) throws -> Data {
+        let summary = summary(now: now, maxPairs: maxPairs, redaction: redaction)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         encoder.dateEncodingStrategy = .iso8601
@@ -180,6 +217,62 @@ public actor SimilarityFeedbackStore {
             events.removeFirst(overflow)
             droppedByCapacity += overflow
         }
+    }
+
+    private func redactedEvents(
+        _ source: [SimilarityQueryEvent],
+        mode: SimilarityFeedbackRedaction
+    ) -> [SimilarityQueryEvent] {
+        guard mode != .none else { return source }
+        return source.map { applyRedaction(to: $0, mode: mode) }
+    }
+
+    private func applyRedaction(
+        to event: SimilarityQueryEvent,
+        mode: SimilarityFeedbackRedaction
+    ) -> SimilarityQueryEvent {
+        switch mode {
+        case .none:
+            return event
+        case .hashQuery:
+            return SimilarityQueryEvent(
+                query: pseudonymize(event.query),
+                selectedKey: event.selectedKey,
+                timestamp: event.timestamp,
+                outcome: event.outcome,
+                locale: event.locale
+            )
+        case .hashQueryAndSelection:
+            return SimilarityQueryEvent(
+                query: pseudonymize(event.query),
+                selectedKey: event.selectedKey.map { pseudonymize($0) },
+                timestamp: event.timestamp,
+                outcome: event.outcome,
+                locale: event.locale
+            )
+        }
+    }
+
+    private func pseudonymize(_ value: String) -> String {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+
+        let message = Data(trimmed.utf8)
+        let digest = HMAC<SHA256>.authenticationCode(for: message, using: redactionKey)
+        return "h:" + Self.hexString(digest)
+    }
+
+    private static func hexString(_ digest: HMAC<SHA256>.MAC) -> String {
+        let hexDigits = Array("0123456789abcdef".utf8)
+        var bytes: [UInt8] = []
+        bytes.reserveCapacity(64)
+
+        for byte in digest {
+            bytes.append(hexDigits[Int(byte >> 4)])
+            bytes.append(hexDigits[Int(byte & 0x0F)])
+        }
+
+        return String(decoding: bytes, as: UTF8.self)
     }
 
     private static func buildPairStats(events: [SimilarityQueryEvent], maxPairs: Int) -> [SimilarityFeedbackPairStat] {

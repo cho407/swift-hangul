@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 public enum SearchRuntimeEnvironment: String, Codable, Sendable, CaseIterable {
     case development
@@ -170,6 +171,8 @@ public struct ResolvedSimilarityWeights: Sendable, Equatable {
 public enum SimilarityDeploymentError: Error {
     case missingEnvironment(SearchRuntimeEnvironment)
     case missingFile(URL)
+    case fileTooLarge(URL, maxBytes: Int, actualBytes: Int64)
+    case symbolicLinkNotAllowed(URL)
 }
 
 public enum SimilarityWeightsResolver {
@@ -272,34 +275,52 @@ public enum SimilarityWeightsResolver {
             return .control
         }
 
-        let hashInput = environmentConfig.abPolicy.salt + "|" + userIdentifier
-        let bucket = hashPercent(hashInput)
+        let bucket = hashPercent(
+            salt: environmentConfig.abPolicy.salt,
+            userIdentifier: userIdentifier
+        )
         return bucket < ratio ? .treatment : .control
     }
 
-    private static func hashPercent(_ value: String) -> Double {
-        let bytes = Array(value.utf8)
-        var hash: UInt64 = 14_695_981_039_346_656_037
-        let prime: UInt64 = 1_099_511_628_211
+    private static func hashPercent(salt: String, userIdentifier: String) -> Double {
+        let normalizedSalt = salt.trimmingCharacters(in: .whitespacesAndNewlines)
+        let keyMaterial = normalizedSalt.isEmpty ? "swift-hangul" : normalizedSalt
+        let key = SymmetricKey(data: Data(keyMaterial.utf8))
+        let digest = HMAC<SHA256>.authenticationCode(
+            for: Data(userIdentifier.utf8),
+            using: key
+        )
 
-        for byte in bytes {
-            hash ^= UInt64(byte)
-            hash = hash &* prime
+        var numeric: UInt64 = 0
+        for byte in digest.prefix(8) {
+            numeric = (numeric << 8) | UInt64(byte)
         }
 
-        return Double(hash % 10_000) / 10_000.0
+        return Double(numeric % 10_000) / 10_000.0
     }
 }
 
-public final class SimilarityConfigFileStore: @unchecked Sendable {
+public actor SimilarityConfigFileStore {
     public let fileURL: URL
+    public let maxFileSizeBytes: Int
     private let fileManager: FileManager
+    private let filePosixPermissions: Int?
+    private let directoryPosixPermissions: Int?
     private let encoder: JSONEncoder
     private let decoder: JSONDecoder
 
-    public init(fileURL: URL, fileManager: FileManager = .default) {
+    public init(
+        fileURL: URL,
+        fileManager: FileManager = .default,
+        maxFileSizeBytes: Int = 1_048_576,
+        filePosixPermissions: Int? = 0o600,
+        directoryPosixPermissions: Int? = 0o700
+    ) {
         self.fileURL = fileURL
         self.fileManager = fileManager
+        self.maxFileSizeBytes = max(4_096, maxFileSizeBytes)
+        self.filePosixPermissions = Self.normalizedPOSIXPermissions(filePosixPermissions)
+        self.directoryPosixPermissions = Self.normalizedPOSIXPermissions(directoryPosixPermissions)
 
         self.encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -311,16 +332,48 @@ public final class SimilarityConfigFileStore: @unchecked Sendable {
 
     public func save(_ config: SimilarityDeploymentConfig) throws {
         let parent = fileURL.deletingLastPathComponent()
-        try fileManager.createDirectory(at: parent, withIntermediateDirectories: true)
+        let directoryAttributes = directoryAttributePayload()
+        try fileManager.createDirectory(
+            at: parent,
+            withIntermediateDirectories: true,
+            attributes: directoryAttributes
+        )
+        if let directoryAttributes {
+            try? fileManager.setAttributes(directoryAttributes, ofItemAtPath: parent.path)
+        }
+        if fileManager.fileExists(atPath: fileURL.path) {
+            try ensureNotSymbolicLink(fileURL)
+        }
+
         let data = try encoder.encode(config)
         try data.write(to: fileURL, options: .atomic)
+        try ensureNotSymbolicLink(fileURL)
+
+        if let fileAttributes = fileAttributePayload() {
+            try? fileManager.setAttributes(fileAttributes, ofItemAtPath: fileURL.path)
+        }
     }
 
     public func load() throws -> SimilarityDeploymentConfig {
         guard fileManager.fileExists(atPath: fileURL.path) else {
             throw SimilarityDeploymentError.missingFile(fileURL)
         }
-        let data = try Data(contentsOf: fileURL)
+
+        try ensureNotSymbolicLink(fileURL)
+
+        let attributes = try fileManager.attributesOfItem(atPath: fileURL.path)
+        if let fileSizeNumber = attributes[.size] as? NSNumber {
+            let actualBytes = fileSizeNumber.int64Value
+            if actualBytes > Int64(maxFileSizeBytes) {
+                throw SimilarityDeploymentError.fileTooLarge(
+                    fileURL,
+                    maxBytes: maxFileSizeBytes,
+                    actualBytes: actualBytes
+                )
+            }
+        }
+
+        let data = try Data(contentsOf: fileURL, options: .mappedIfSafe)
         return try decoder.decode(SimilarityDeploymentConfig.self, from: data)
     }
 
@@ -337,5 +390,28 @@ public final class SimilarityConfigFileStore: @unchecked Sendable {
             return nil
         }
         return try loadSanitized()
+    }
+
+    private func ensureNotSymbolicLink(_ url: URL) throws {
+        let attributes = try fileManager.attributesOfItem(atPath: url.path)
+        if let fileType = attributes[.type] as? FileAttributeType,
+           fileType == .typeSymbolicLink {
+            throw SimilarityDeploymentError.symbolicLinkNotAllowed(url)
+        }
+    }
+
+    private func fileAttributePayload() -> [FileAttributeKey: Any]? {
+        guard let filePosixPermissions else { return nil }
+        return [.posixPermissions: NSNumber(value: filePosixPermissions)]
+    }
+
+    private func directoryAttributePayload() -> [FileAttributeKey: Any]? {
+        guard let directoryPosixPermissions else { return nil }
+        return [.posixPermissions: NSNumber(value: directoryPosixPermissions)]
+    }
+
+    private static func normalizedPOSIXPermissions(_ value: Int?) -> Int? {
+        guard let value else { return nil }
+        return min(0o777, max(0, value))
     }
 }

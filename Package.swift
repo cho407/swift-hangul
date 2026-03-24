@@ -12,7 +12,6 @@ let package = Package(
     products: [
         .library(name: "HangulCore", targets: ["HangulCore"]),
         .library(name: "HangulSearch", targets: ["HangulSearch"]),
-        .library(name: "HangulSearchable", targets: ["HangulSearchable"]),
     ],
     targets: [
         .target(
@@ -24,11 +23,6 @@ let package = Package(
             dependencies: ["HangulCore"],
             path: "Sources/HangulSearch"
         ),
-        .target(
-            name: "HangulSearchable",
-            dependencies: ["HangulSearch"],
-            path: "Sources/HangulSearchable"
-        ),
         .testTarget(
             name: "HangulCoreTests",
             dependencies: ["HangulCore"],
@@ -38,11 +32,6 @@ let package = Package(
             name: "HangulSearchTests",
             dependencies: ["HangulSearch"],
             path: "Tests/HangulSearchTests"
-        ),
-        .testTarget(
-            name: "HangulSearchableTests",
-            dependencies: ["HangulSearchable", "HangulSearch"],
-            path: "Tests/HangulSearchableTests"
         ),
     ]
 )

@@ -1,19 +1,37 @@
 import Foundation
 import HangulCore
 
-public final class HangulSearchIndex<Item>: @unchecked Sendable {
+public final class HangulSearchIndex<Item: Sendable>: @unchecked Sendable {
     private let items: [Item]
     private let rawKeys: [String]
     private let normalizedRawKeys: [String]
+    private let normalizedCompactedRawKeys: [String]
     private let policy: SearchPolicy
     private let allIndices: [Int]
 
     private let precomputedKeys: [String]?
-    private let ngramIndex: [String: [Int]]?
+    private let ngramChoseongIndex: [String: [Int]]?
+    private let ngramRawIndex: [String: [Int]]?
+    private let ngramRawCompactedIndex: [String: [Int]]?
 
     private let queryCache: LRUCache<String, [Int]>?
     private let lazyMaterializer: LazyKeyMaterializer?
     private let telemetry: SearchTelemetry
+
+    private enum QueryMatchTarget: String {
+        case raw
+        case choseong
+    }
+
+    private struct SearchQueryContext {
+        let normalizedQuery: String
+        let normalizedCompactedQuery: String
+        let target: QueryMatchTarget
+
+        var cacheToken: String {
+            target.rawValue + "|" + normalizedQuery + "|" + normalizedCompactedQuery
+        }
+    }
 
     private struct SimilarityCandidate {
         let index: Int
@@ -52,6 +70,7 @@ public final class HangulSearchIndex<Item>: @unchecked Sendable {
         self.items = items
         self.rawKeys = items.map { $0[keyPath: keyPath] }
         self.normalizedRawKeys = self.rawKeys.map(Self.normalizedSearchToken)
+        self.normalizedCompactedRawKeys = self.normalizedRawKeys.map(Self.compactedSearchToken)
         self.policy = policy
         self.allIndices = Array(items.indices)
         self.telemetry = SearchTelemetry()
@@ -65,13 +84,17 @@ public final class HangulSearchIndex<Item>: @unchecked Sendable {
 
         switch policy.indexStrategy {
         case .precompute:
-            let keys = rawKeys.map { Hangul.getChoseong($0, options: policy.choseongOptions) }
+            let keys = rawKeys.map { Self.normalizedSearchToken(Hangul.getChoseong($0, options: policy.choseongOptions)) }
             self.precomputedKeys = keys
-            self.ngramIndex = nil
+            self.ngramChoseongIndex = nil
+            self.ngramRawIndex = nil
+            self.ngramRawCompactedIndex = nil
             self.lazyMaterializer = nil
         case .lazyCache:
             self.precomputedKeys = nil
-            self.ngramIndex = nil
+            self.ngramChoseongIndex = nil
+            self.ngramRawIndex = nil
+            self.ngramRawCompactedIndex = nil
             let materializer = LazyKeyMaterializer()
             self.lazyMaterializer = materializer
             if policy.lazyWarmup == .background {
@@ -79,9 +102,11 @@ public final class HangulSearchIndex<Item>: @unchecked Sendable {
             }
         case let .ngram(k):
             let effectiveK = max(2, min(3, k))
-            let keys = rawKeys.map { Hangul.getChoseong($0, options: policy.choseongOptions) }
+            let keys = rawKeys.map { Self.normalizedSearchToken(Hangul.getChoseong($0, options: policy.choseongOptions)) }
             self.precomputedKeys = keys
-            self.ngramIndex = Self.buildNgramIndex(keys: keys, k: effectiveK)
+            self.ngramChoseongIndex = Self.buildNgramIndex(keys: keys, k: effectiveK)
+            self.ngramRawIndex = Self.buildNgramIndex(keys: self.normalizedRawKeys, k: effectiveK)
+            self.ngramRawCompactedIndex = Self.buildNgramIndex(keys: self.normalizedCompactedRawKeys, k: effectiveK)
             self.lazyMaterializer = nil
         }
     }
@@ -99,38 +124,78 @@ public final class HangulSearchIndex<Item>: @unchecked Sendable {
             )
         }
 
-        let normalizedQuery = boundedNormalizedChoseongQuery(query)
-        guard !normalizedQuery.isEmpty else { return output }
+        let queryContext = boundedSearchQueryContext(query)
+        guard !queryContext.normalizedQuery.isEmpty else { return output }
 
-        let cacheKey = mode.rawValue + "|" + normalizedQuery
+        let cacheKey = mode.rawValue + "|" + queryContext.cacheToken
         if let cached = queryCache?.get(cacheKey) {
             usedCache = true
             output = cached.map { items[$0] }
             return output
         }
 
-        let candidates = candidateIndicesForSearch(query: normalizedQuery)
+        let candidates = candidateIndicesForSearch(
+            query: queryContext.normalizedQuery,
+            compactedQuery: queryContext.normalizedCompactedQuery,
+            target: queryContext.target
+        )
         let matched: [Int]
 
         switch policy.indexStrategy {
         case .precompute, .ngram:
-            guard let precomputedKeys else {
-                matched = []
-                break
+            switch queryContext.target {
+            case .raw:
+                matched = filterRawIndices(
+                    candidates: candidates,
+                    query: queryContext.normalizedQuery,
+                    compactedQuery: queryContext.normalizedCompactedQuery,
+                    mode: mode
+                )
+            case .choseong:
+                guard let precomputedKeys else {
+                    matched = []
+                    break
+                }
+                matched = filterIndices(
+                    candidates: candidates,
+                    query: queryContext.normalizedQuery,
+                    mode: mode,
+                    keys: precomputedKeys
+                )
             }
-            matched = filterIndices(candidates: candidates, query: normalizedQuery, mode: mode, keys: precomputedKeys)
         case .lazyCache:
-            if let lazyMaterializer {
-                let keys = lazyMaterializer.getOrBuild(rawKeys: rawKeys, options: policy.choseongOptions)
-                matched = filterIndices(candidates: candidates, query: normalizedQuery, mode: mode, keys: keys)
-            } else {
-                matched = filterIndices(candidates: candidates, query: normalizedQuery, mode: mode) { index in
-                    Hangul.getChoseong(rawKeys[index], options: policy.choseongOptions)
+            switch queryContext.target {
+            case .raw:
+                matched = filterRawIndices(
+                    candidates: candidates,
+                    query: queryContext.normalizedQuery,
+                    compactedQuery: queryContext.normalizedCompactedQuery,
+                    mode: mode
+                )
+            case .choseong:
+                if let lazyMaterializer {
+                    let keys = lazyMaterializer.getOrBuild(rawKeys: rawKeys, options: policy.choseongOptions)
+                    matched = filterIndices(
+                        candidates: candidates,
+                        query: queryContext.normalizedQuery,
+                        mode: mode,
+                        keys: keys
+                    )
+                } else {
+                    matched = filterIndices(
+                        candidates: candidates,
+                        query: queryContext.normalizedQuery,
+                        mode: mode
+                    ) { index in
+                        Self.normalizedSearchToken(
+                            Hangul.getChoseong(rawKeys[index], options: policy.choseongOptions)
+                        )
+                    }
                 }
             }
         }
 
-        queryCache?.set(cacheKey, value: matched)
+        storeQueryCache(cacheKey: cacheKey, matchedIndices: matched)
         output = matched.map { items[$0] }
         return output
     }
@@ -141,9 +206,10 @@ public final class HangulSearchIndex<Item>: @unchecked Sendable {
 
         do {
             try Task.checkCancellation()
+            await Task.yield()
 
-            let normalizedQuery = boundedNormalizedChoseongQuery(query)
-            guard !normalizedQuery.isEmpty else {
+            let queryContext = boundedSearchQueryContext(query)
+            guard !queryContext.normalizedQuery.isEmpty else {
                 telemetry.recordAsyncSearchSuccess(
                     latencyNs: Self.elapsedNanoseconds(since: startedAt),
                     cacheHit: false,
@@ -152,7 +218,7 @@ public final class HangulSearchIndex<Item>: @unchecked Sendable {
                 return []
             }
 
-            let cacheKey = mode.rawValue + "|" + normalizedQuery
+            let cacheKey = mode.rawValue + "|" + queryContext.cacheToken
             if let cached = queryCache?.get(cacheKey) {
                 usedCache = true
                 let output = cached.map { items[$0] }
@@ -164,46 +230,92 @@ public final class HangulSearchIndex<Item>: @unchecked Sendable {
                 return output
             }
 
-            let candidates = candidateIndicesForSearch(query: normalizedQuery)
+            let candidates = candidateIndicesForSearch(
+                query: queryContext.normalizedQuery,
+                compactedQuery: queryContext.normalizedCompactedQuery,
+                target: queryContext.target
+            )
             let matched: [Int]
 
             switch policy.indexStrategy {
             case .precompute, .ngram:
-                guard let precomputedKeys else {
-                    matched = []
-                    break
-                }
-                matched = try filterIndicesCancellable(candidates: candidates, query: normalizedQuery, mode: mode) { index in
-                    precomputedKeys[index]
+                switch queryContext.target {
+                case .raw:
+                    matched = try filterRawIndicesCancellable(
+                        candidates: candidates,
+                        query: queryContext.normalizedQuery,
+                        compactedQuery: queryContext.normalizedCompactedQuery,
+                        mode: mode
+                    )
+                case .choseong:
+                    guard let precomputedKeys else {
+                        matched = []
+                        break
+                    }
+                    matched = try filterIndicesCancellable(
+                        candidates: candidates,
+                        query: queryContext.normalizedQuery,
+                        mode: mode
+                    ) { index in
+                        precomputedKeys[index]
+                    }
                 }
             case .lazyCache:
-                if let lazyMaterializer, let readyKeys = lazyMaterializer.readyKeys() {
-                    matched = try filterIndicesCancellable(candidates: candidates, query: normalizedQuery, mode: mode) { index in
-                        readyKeys[index]
-                    }
-                } else {
-                    var materialized = Array(repeating: "", count: rawKeys.count)
-                    var localMatched: [Int] = []
-                    localMatched.reserveCapacity(min(candidates.count, 64))
+                switch queryContext.target {
+                case .raw:
+                    matched = try filterRawIndicesCancellable(
+                        candidates: candidates,
+                        query: queryContext.normalizedQuery,
+                        compactedQuery: queryContext.normalizedCompactedQuery,
+                        mode: mode
+                    )
+                case .choseong:
+                    if let lazyMaterializer, let readyKeys = lazyMaterializer.readyKeys() {
+                        matched = try filterIndicesCancellable(
+                            candidates: candidates,
+                            query: queryContext.normalizedQuery,
+                            mode: mode
+                        ) { index in
+                            readyKeys[index]
+                        }
+                    } else {
+                        let shouldPersistFullMaterialization =
+                            candidates.count == rawKeys.count && candidates.elementsEqual(allIndices)
+                        var materialized: [String]? = shouldPersistFullMaterialization
+                            ? Array(repeating: "", count: rawKeys.count)
+                            : nil
+                        var localMatched: [Int] = []
+                        localMatched.reserveCapacity(min(candidates.count, 64))
 
-                    for (offset, index) in candidates.enumerated() {
-                        if offset % 16 == 0 {
-                            try Task.checkCancellation()
+                        for (offset, index) in candidates.enumerated() {
+                            if offset % 16 == 0 {
+                                try Task.checkCancellation()
+                            }
+
+                            let key = Self.normalizedSearchToken(
+                                Hangul.getChoseong(rawKeys[index], options: policy.choseongOptions)
+                            )
+                            if shouldPersistFullMaterialization {
+                                materialized?[index] = key
+                            }
+                            if mode.matches(text: key, query: queryContext.normalizedQuery) {
+                                localMatched.append(index)
+                            }
                         }
 
-                        let key = Hangul.getChoseong(rawKeys[index], options: policy.choseongOptions)
-                        materialized[index] = key
-                        if mode.matches(text: key, query: normalizedQuery) {
-                            localMatched.append(index)
+                        // Persist lazy materialization only when full key coverage is guaranteed.
+                        // Storing partial arrays can poison future lookups with empty keys.
+                        if shouldPersistFullMaterialization, let materialized {
+                            lazyMaterializer?.storeBuiltKeysIfNeeded(materialized)
+                        } else if policy.lazyWarmup == .background {
+                            lazyMaterializer?.startBackgroundBuild(rawKeys: rawKeys, options: policy.choseongOptions)
                         }
+                        matched = localMatched
                     }
-
-                    lazyMaterializer?.storeBuiltKeysIfNeeded(materialized)
-                    matched = localMatched
                 }
             }
 
-            queryCache?.set(cacheKey, value: matched)
+            storeQueryCache(cacheKey: cacheKey, matchedIndices: matched)
             let output = matched.map { items[$0] }
             telemetry.recordAsyncSearchSuccess(
                 latencyNs: Self.elapsedNanoseconds(since: startedAt),
@@ -240,7 +352,7 @@ public final class HangulSearchIndex<Item>: @unchecked Sendable {
         )
         guard !variants.isEmpty else { return output }
 
-        let choseongKeys = choseongKeysForScoring().map(Self.normalizedSearchToken)
+        let choseongKeys = choseongKeysForScoring()
         let ranked = rankSimilarImpl(
             variants: variants,
             choseongKeys: choseongKeys,
@@ -259,6 +371,7 @@ public final class HangulSearchIndex<Item>: @unchecked Sendable {
 
         do {
             try Task.checkCancellation()
+            await Task.yield()
 
             let variants = boundedQueryVariants(
                 for: query,
@@ -272,7 +385,7 @@ public final class HangulSearchIndex<Item>: @unchecked Sendable {
                 return []
             }
 
-            let choseongKeys = try choseongKeysForScoringCancellable().map(Self.normalizedSearchToken)
+            let choseongKeys = try choseongKeysForScoringCancellable()
             let ranked = try rankSimilarImpl(
                 variants: variants,
                 choseongKeys: choseongKeys,
@@ -314,7 +427,7 @@ public final class HangulSearchIndex<Item>: @unchecked Sendable {
         )
         guard !variants.isEmpty else { return output }
 
-        let choseongKeys = choseongKeysForScoring().map(Self.normalizedSearchToken)
+        let choseongKeys = choseongKeysForScoring()
         let ranked = rankSimilarImpl(
             variants: variants,
             choseongKeys: choseongKeys,
@@ -333,6 +446,7 @@ public final class HangulSearchIndex<Item>: @unchecked Sendable {
 
         do {
             try Task.checkCancellation()
+            await Task.yield()
 
             let variants = boundedQueryVariants(
                 for: query,
@@ -346,7 +460,7 @@ public final class HangulSearchIndex<Item>: @unchecked Sendable {
                 return []
             }
 
-            let choseongKeys = try choseongKeysForScoringCancellable().map(Self.normalizedSearchToken)
+            let choseongKeys = try choseongKeysForScoringCancellable()
             let ranked = try rankSimilarImpl(
                 variants: variants,
                 choseongKeys: choseongKeys,
@@ -476,7 +590,13 @@ public final class HangulSearchIndex<Item>: @unchecked Sendable {
         cancellationCheck: (() throws -> Void)?
     ) rethrows -> [SimilarityCandidate] {
         let lookupQuery = choseongQuery.isEmpty ? variant : choseongQuery
-        let base = candidateIndicesForSearch(query: lookupQuery)
+        let matchTarget: QueryMatchTarget = choseongQuery.isEmpty ? .raw : .choseong
+        let normalizedLookup = Self.normalizedSearchToken(lookupQuery)
+        let base = candidateIndicesForSearch(
+            query: normalizedLookup,
+            compactedQuery: Self.compactedSearchToken(normalizedLookup),
+            target: matchTarget
+        )
 
         let targetCandidateCount = min(
             base.count,
@@ -799,6 +919,17 @@ public final class HangulSearchIndex<Item>: @unchecked Sendable {
         text.precomposedStringWithCanonicalMapping.lowercased()
     }
 
+    private static func compactedSearchToken(_ text: String) -> String {
+        var scalars: [UnicodeScalar] = []
+        scalars.reserveCapacity(text.unicodeScalars.count)
+
+        for scalar in text.unicodeScalars where !scalar.properties.isWhitespace {
+            scalars.append(scalar)
+        }
+
+        return String(String.UnicodeScalarView(scalars))
+    }
+
     private func boundedRawQuery(_ query: String) -> String {
         guard let maxQueryLength = policy.maxQueryLength else {
             return query
@@ -809,9 +940,30 @@ public final class HangulSearchIndex<Item>: @unchecked Sendable {
         return String(query.prefix(maxQueryLength))
     }
 
-    private func boundedNormalizedChoseongQuery(_ query: String) -> String {
-        let raw = boundedRawQuery(query)
-        return Hangul.getChoseong(raw, options: policy.choseongOptions)
+    private func boundedSearchQueryContext(_ query: String) -> SearchQueryContext {
+        let bounded = boundedRawQuery(query)
+        let normalizedRaw = Self.normalizedSearchToken(bounded)
+        let compactedRaw = Self.compactedSearchToken(normalizedRaw)
+        guard !normalizedRaw.isEmpty else {
+            return SearchQueryContext(normalizedQuery: "", normalizedCompactedQuery: "", target: .raw)
+        }
+
+        if Self.isChoseongOnlyQuery(normalizedRaw) {
+            let choseong = Self.normalizedSearchToken(
+                Hangul.getChoseong(bounded, options: policy.choseongOptions)
+            )
+            return SearchQueryContext(
+                normalizedQuery: choseong,
+                normalizedCompactedQuery: Self.compactedSearchToken(choseong),
+                target: .choseong
+            )
+        }
+
+        return SearchQueryContext(
+            normalizedQuery: normalizedRaw,
+            normalizedCompactedQuery: compactedRaw,
+            target: .raw
+        )
     }
 
     private func boundedQueryVariants(for query: String, includeLayoutVariants: Bool) -> [String] {
@@ -822,19 +974,25 @@ public final class HangulSearchIndex<Item>: @unchecked Sendable {
     private func choseongKeysForScoring() -> [String] {
         switch policy.indexStrategy {
         case .precompute, .ngram:
-            return precomputedKeys ?? rawKeys.map { Hangul.getChoseong($0, options: policy.choseongOptions) }
+            return precomputedKeys ?? rawKeys.map {
+                Self.normalizedSearchToken(Hangul.getChoseong($0, options: policy.choseongOptions))
+            }
         case .lazyCache:
             if let lazyMaterializer {
                 return lazyMaterializer.getOrBuild(rawKeys: rawKeys, options: policy.choseongOptions)
             }
-            return rawKeys.map { Hangul.getChoseong($0, options: policy.choseongOptions) }
+            return rawKeys.map {
+                Self.normalizedSearchToken(Hangul.getChoseong($0, options: policy.choseongOptions))
+            }
         }
     }
 
     private func choseongKeysForScoringCancellable() throws -> [String] {
         switch policy.indexStrategy {
         case .precompute, .ngram:
-            return precomputedKeys ?? rawKeys.map { Hangul.getChoseong($0, options: policy.choseongOptions) }
+            return precomputedKeys ?? rawKeys.map {
+                Self.normalizedSearchToken(Hangul.getChoseong($0, options: policy.choseongOptions))
+            }
         case .lazyCache:
             if let lazyMaterializer, let ready = lazyMaterializer.readyKeys() {
                 return ready
@@ -845,7 +1003,9 @@ public final class HangulSearchIndex<Item>: @unchecked Sendable {
                 if offset % 16 == 0 {
                     try Task.checkCancellation()
                 }
-                built[index] = Hangul.getChoseong(rawKeys[index], options: policy.choseongOptions)
+                built[index] = Self.normalizedSearchToken(
+                    Hangul.getChoseong(rawKeys[index], options: policy.choseongOptions)
+                )
             }
 
             lazyMaterializer?.storeBuiltKeysIfNeeded(built)
@@ -853,39 +1013,111 @@ public final class HangulSearchIndex<Item>: @unchecked Sendable {
         }
     }
 
-    private func candidateIndices(for query: String) -> [Int] {
-        guard case let .ngram(rawK) = policy.indexStrategy,
-              let ngramIndex else {
+    private func candidateIndices(
+        for query: String,
+        compactedQuery: String,
+        target: QueryMatchTarget
+    ) -> [Int] {
+        guard case let .ngram(rawK) = policy.indexStrategy else {
             return allIndices
         }
 
         let k = max(2, min(3, rawK))
-        let grams = Self.makeNgrams(text: query, k: k)
-        guard !grams.isEmpty else {
-            return allIndices
-        }
+        func candidateList(
+            from index: [String: [Int]]?,
+            queryToken: String
+        ) -> [Int]? {
+            guard let index else { return nil }
 
-        var candidateSet: Set<Int>?
-        for gram in Set(grams) {
-            guard let posting = ngramIndex[gram] else {
-                return []
+            let grams = Set(Self.makeNgrams(text: queryToken, k: k))
+            guard !grams.isEmpty else { return nil }
+
+            var postings: [[Int]] = []
+            postings.reserveCapacity(grams.count)
+
+            for gram in grams {
+                guard let posting = index[gram] else {
+                    return []
+                }
+                postings.append(posting)
             }
 
-            let postingSet = Set(posting)
-            if var existing = candidateSet {
-                existing.formIntersection(postingSet)
-                if existing.isEmpty { return [] }
-                candidateSet = existing
-            } else {
-                candidateSet = postingSet
+            postings.sort { $0.count < $1.count }
+            guard var intersection = postings.first else { return [] }
+            for posting in postings.dropFirst() {
+                intersection = Self.sortedIntersection(intersection, posting)
+                if intersection.isEmpty { return [] }
             }
+            return intersection
         }
 
-        return candidateSet?.sorted() ?? allIndices
+        switch target {
+        case .choseong:
+            guard let list = candidateList(from: ngramChoseongIndex, queryToken: query) else {
+                return allIndices
+            }
+            return list
+        case .raw:
+            var union: [Int] = []
+            var hasAnyList = false
+
+            if let normalList = candidateList(from: ngramRawIndex, queryToken: query) {
+                union = normalList
+                hasAnyList = true
+            }
+
+            if let compactList = candidateList(from: ngramRawCompactedIndex, queryToken: compactedQuery) {
+                union = hasAnyList ? Self.sortedUnion(union, compactList) : compactList
+                hasAnyList = true
+            }
+
+            guard hasAnyList else { return allIndices }
+            return union
+        }
     }
 
-    private func candidateIndicesForSearch(query: String) -> [Int] {
-        applyCandidateScanLimit(candidateIndices(for: query))
+    private func candidateIndicesForSearch(
+        query: String,
+        compactedQuery: String,
+        target: QueryMatchTarget
+    ) -> [Int] {
+        applyCandidateScanLimit(
+            candidateIndices(
+                for: query,
+                compactedQuery: compactedQuery,
+                target: target
+            )
+        )
+    }
+
+    private static func isChoseongOnlyQuery(_ token: String) -> Bool {
+        guard !token.isEmpty else { return false }
+
+        for scalar in token.unicodeScalars {
+            if scalar.properties.isWhitespace {
+                continue
+            }
+            if isChoseongScalar(scalar) {
+                continue
+            }
+            return false
+        }
+        return true
+    }
+
+    private static func isChoseongScalar(_ scalar: UnicodeScalar) -> Bool {
+        switch scalar.value {
+        case 0x1100...0x1112: // Hangul Jamo Choseong
+            return true
+        case 0x3131...0x314E: // Hangul Compatibility Jamo consonants
+            return true
+        case 0xA960...0xA97C: // Hangul Jamo Extended-A choseong
+            return true
+        case 0xFFA1...0xFFBE: // Halfwidth Hangul consonants
+            return true
+        default:
+            return false
+        }
     }
 
     private func applyCandidateScanLimit(_ candidates: [Int]) -> [Int] {
@@ -894,6 +1126,61 @@ public final class HangulSearchIndex<Item>: @unchecked Sendable {
             return candidates
         }
         return Array(candidates.prefix(maxCandidateScan))
+    }
+
+    private func rawMatch(
+        index: Int,
+        query: String,
+        compactedQuery: String,
+        mode: MatchMode
+    ) -> Bool {
+        if mode.matches(text: normalizedRawKeys[index], query: query) {
+            return true
+        }
+        if compactedQuery.isEmpty {
+            return false
+        }
+        return mode.matches(text: normalizedCompactedRawKeys[index], query: compactedQuery)
+    }
+
+    private func filterRawIndices(
+        candidates: [Int],
+        query: String,
+        compactedQuery: String,
+        mode: MatchMode
+    ) -> [Int] {
+        var matched: [Int] = []
+        matched.reserveCapacity(min(candidates.count, 64))
+
+        for index in candidates {
+            if rawMatch(index: index, query: query, compactedQuery: compactedQuery, mode: mode) {
+                matched.append(index)
+            }
+        }
+
+        return matched
+    }
+
+    private func filterRawIndicesCancellable(
+        candidates: [Int],
+        query: String,
+        compactedQuery: String,
+        mode: MatchMode
+    ) throws -> [Int] {
+        var matched: [Int] = []
+        matched.reserveCapacity(min(candidates.count, 64))
+
+        for (offset, index) in candidates.enumerated() {
+            if offset % 16 == 0 {
+                try Task.checkCancellation()
+            }
+
+            if rawMatch(index: index, query: query, compactedQuery: compactedQuery, mode: mode) {
+                matched.append(index)
+            }
+        }
+
+        return matched
     }
 
     private func filterIndices(candidates: [Int], query: String, mode: MatchMode, keys: [String]) -> [Int] {
@@ -962,6 +1249,70 @@ public final class HangulSearchIndex<Item>: @unchecked Sendable {
         return index
     }
 
+    private static func sortedIntersection(_ lhs: [Int], _ rhs: [Int]) -> [Int] {
+        guard !lhs.isEmpty, !rhs.isEmpty else { return [] }
+
+        var result: [Int] = []
+        result.reserveCapacity(min(lhs.count, rhs.count))
+
+        var leftIndex = 0
+        var rightIndex = 0
+        while leftIndex < lhs.count, rightIndex < rhs.count {
+            let left = lhs[leftIndex]
+            let right = rhs[rightIndex]
+            if left == right {
+                result.append(left)
+                leftIndex += 1
+                rightIndex += 1
+            } else if left < right {
+                leftIndex += 1
+            } else {
+                rightIndex += 1
+            }
+        }
+
+        return result
+    }
+
+    private static func sortedUnion(_ lhs: [Int], _ rhs: [Int]) -> [Int] {
+        guard !lhs.isEmpty else { return rhs }
+        guard !rhs.isEmpty else { return lhs }
+
+        var result: [Int] = []
+        result.reserveCapacity(lhs.count + rhs.count)
+
+        var leftIndex = 0
+        var rightIndex = 0
+        while leftIndex < lhs.count || rightIndex < rhs.count {
+            if rightIndex >= rhs.count {
+                result.append(lhs[leftIndex])
+                leftIndex += 1
+                continue
+            }
+            if leftIndex >= lhs.count {
+                result.append(rhs[rightIndex])
+                rightIndex += 1
+                continue
+            }
+
+            let left = lhs[leftIndex]
+            let right = rhs[rightIndex]
+            if left == right {
+                result.append(left)
+                leftIndex += 1
+                rightIndex += 1
+            } else if left < right {
+                result.append(left)
+                leftIndex += 1
+            } else {
+                result.append(right)
+                rightIndex += 1
+            }
+        }
+
+        return result
+    }
+
     private static func makeNgrams(text: String, k: Int) -> [String] {
         let scalars = Array(text.unicodeScalars)
         guard scalars.count >= k else { return [] }
@@ -982,5 +1333,14 @@ public final class HangulSearchIndex<Item>: @unchecked Sendable {
     private static func elapsedNanoseconds(since start: UInt64) -> UInt64 {
         let now = DispatchTime.now().uptimeNanoseconds
         return now >= start ? (now - start) : 0
+    }
+
+    private func storeQueryCache(cacheKey: String, matchedIndices: [Int]) {
+        guard let queryCache else { return }
+        if let maxCachedResultCount = policy.maxCachedResultCount,
+           matchedIndices.count > maxCachedResultCount {
+            return
+        }
+        queryCache.set(cacheKey, value: matchedIndices)
     }
 }

@@ -4,7 +4,7 @@ final class LRUCache<Key: Hashable, Value>: @unchecked Sendable {
     private final class Node {
         let key: Key
         var value: Value
-        var prev: Node?
+        weak var prev: Node?
         var next: Node?
 
         init(key: Key, value: Value) {
@@ -99,6 +99,7 @@ final class LRUCache<Key: Hashable, Value>: @unchecked Sendable {
             tail = nil
         }
 
+        head.next = nil
         storage.removeValue(forKey: head.key)
     }
 }

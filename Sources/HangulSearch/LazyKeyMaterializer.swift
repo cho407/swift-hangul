@@ -71,6 +71,10 @@ final class LazyKeyMaterializer: @unchecked Sendable {
     }
 
     private static func buildKeys(rawKeys: [String], options: ChoseongOptions) -> [String] {
-        rawKeys.map { Hangul.getChoseong($0, options: options) }
+        rawKeys.map { canonical(Hangul.getChoseong($0, options: options)) }
+    }
+
+    private static func canonical(_ text: String) -> String {
+        text.precomposedStringWithCanonicalMapping.lowercased()
     }
 }
