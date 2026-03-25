@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.0.1 - 2026-03-25
+
+### Changed
+
+- CI/Actions
+  - `actions/checkout` upgraded to `v5` for Node 24 migration readiness
+  - `FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true` applied in workflows
+  - secret scan step now falls back to `grep` when `rg` is unavailable on runner
+
+- Build compatibility
+  - `Package.swift` tools version lowered from `6.2` to `6.0`
+  - README minimum Swift version updated to `6.0+`
+
+- Test stability
+  - search performance thresholds adjusted for CI host variance
+  - retained relative performance guard (`ngram` p95 must stay faster than `precompute`)
+
 ## 1.0.0 - 2026-03-22
 
 ### Added
