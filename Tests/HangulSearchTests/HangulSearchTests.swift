@@ -282,18 +282,23 @@ final class HangulSearchTests: XCTestCase {
             _ = ngram.search("ㅍㄹㅌㅇㄷ", mode: .contains)
         }
 
+        let isCI = ProcessInfo.processInfo.environment["CI"] == "true"
+        let queryP95Limit = isCI ? 200.0 : 120.0
+
         XCTAssertLessThan(buildPrecompute.meanMs, 1_500)
         // CI/host variance can significantly affect lazy build due concurrent CPU pressure.
         XCTAssertLessThan(buildLazy.meanMs, 450)
         XCTAssertLessThan(buildNgram.meanMs, 2_500)
-        XCTAssertLessThan(queryPrecompute.p95Ms, 120)
-        XCTAssertLessThan(queryLazyWarm.p95Ms, 120)
+        XCTAssertLessThan(queryPrecompute.p95Ms, queryP95Limit)
+        XCTAssertLessThan(queryLazyWarm.p95Ms, queryP95Limit)
         XCTAssertLessThan(queryNgram.p95Ms, 150)
         XCTAssertLessThan(lazyColdStart.maxMs, 8_000)
         XCTAssertLessThan(queryPrecompute.stdMs, 25)
         XCTAssertLessThan(queryLazyWarm.stdMs, 40)
         XCTAssertLessThan(queryNgram.stdMs, 35)
-        XCTAssertLessThan(queryLazyBackgroundWarm.p95Ms, 120)
+        XCTAssertLessThan(queryLazyBackgroundWarm.p95Ms, queryP95Limit)
+        // Keep relative performance intent even when absolute CI latency fluctuates.
+        XCTAssertLessThan(queryNgram.p95Ms, queryPrecompute.p95Ms)
     }
 
     func testLazyBackgroundWarmupCorrectness() {

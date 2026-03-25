@@ -28,12 +28,17 @@ jobs:
       - name: Secret Pattern Scan
         run: |
           set -euo pipefail
-          if rg -n \
-            '(BEGIN (RSA|EC|OPENSSH|PRIVATE) KEY|AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{36}|xox[baprs]-|AIza[0-9A-Za-z\-_]{35})' \
-            --glob '!.build/**' \
-            .; then
-            echo "Potential secret pattern found."
-            exit 1
+          pattern='(BEGIN (RSA|EC|OPENSSH|PRIVATE) KEY|AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{36}|xox[baprs]-|AIza[0-9A-Za-z\-_]{35})'
+          if command -v rg >/dev/null 2>&1; then
+            if rg -n "$pattern" --glob '!.build/**' .; then
+              echo "Potential secret pattern found."
+              exit 1
+            fi
+          else
+            if grep -R -n -E "$pattern" . --exclude-dir=.build; then
+              echo "Potential secret pattern found."
+              exit 1
+            fi
           fi
 
       - name: Setup Xcode
