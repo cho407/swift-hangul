@@ -20,7 +20,7 @@
 
 ## Requirements
 
-- Swift 6.2+
+- Swift 6.0+
 - iOS 15+
 - macOS 14+
 
