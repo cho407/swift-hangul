@@ -14,6 +14,7 @@ public struct SimilarityNightlyTuningOptions: Sendable, Equatable {
     public var leaderboardSize: Int
     public var seed: UInt64
     public var modelVersionPrefix: String
+    public var distanceAlgorithm: SimilarityDistanceAlgorithm
 
     public static let `default` = SimilarityNightlyTuningOptions()
 
@@ -30,7 +31,8 @@ public struct SimilarityNightlyTuningOptions: Sendable, Equatable {
         maxCandidates: Int = 80,
         leaderboardSize: Int = 10,
         seed: UInt64 = 0xA192_2026_0225_0001,
-        modelVersionPrefix: String = "nightly"
+        modelVersionPrefix: String = "nightly",
+        distanceAlgorithm: SimilarityDistanceAlgorithm = .levenshtein
     ) {
         self.environment = environment
         self.targetBucket = targetBucket
@@ -45,6 +47,7 @@ public struct SimilarityNightlyTuningOptions: Sendable, Equatable {
         self.leaderboardSize = max(1, leaderboardSize)
         self.seed = seed
         self.modelVersionPrefix = modelVersionPrefix
+        self.distanceAlgorithm = distanceAlgorithm
     }
 }
 
@@ -117,10 +120,13 @@ public extension HangulSearchIndex {
             minimumScore: options.minimumScore,
             maxCandidates: options.maxCandidates,
             leaderboardSize: options.leaderboardSize,
-            seed: options.seed
+            seed: options.seed,
+            distanceAlgorithm: options.distanceAlgorithm
         )
 
-        let report = tuneSimilarityWeights(samples: samples, options: tuningOptions)
+        let split = SimilarityDataset.split(samples, seed: options.seed)
+        guard !split.validation.isEmpty else { throw SimilarityNightlyTuningError.insufficientSamples }
+        let report = tuneSimilarityWeights(samples: split.training, validationSamples: split.validation, options: tuningOptions)
 
         switch options.targetBucket {
         case .control:

@@ -306,6 +306,8 @@ final class HangulCoreTests: XCTestCase {
 
             let syllable = String(scalar)
             let choseong = Hangul.getChoseong(syllable, options: .init(preserveNonHangul: false, whitespacePolicy: .remove))
+            XCTAssertEqual(choseong, Hangul.choseongs[(value - 0xAC00) / 588])
+            XCTAssertEqual(Hangul.getChoseong(syllable.decomposedStringWithCanonicalMapping), choseong)
             XCTAssertEqual(choseong.count, 1, "Unexpected choseong length at U+\(String(value, radix: 16).uppercased())")
             XCTAssertTrue(Hangul.canBeChoseong(choseong), "Invalid choseong token at U+\(String(value, radix: 16).uppercased())")
         }

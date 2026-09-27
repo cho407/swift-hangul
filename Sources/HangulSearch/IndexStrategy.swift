@@ -22,7 +22,10 @@ public struct SearchPolicy: Sendable {
     public var indexStrategy: IndexStrategy
     public var cache: CachePolicy
     public var lazyWarmup: LazyWarmupPolicy
+    /// Clamped to 1...4,096 when present. nil explicitly disables query bounding.
+    /// An additional four-scalars-per-character budget bounds pathological combining sequences.
     public var maxQueryLength: Int?
+    /// A scan cap trades recall for latency, including in direct search.
     public var maxCandidateScan: Int?
     public var maxCachedResultCount: Int?
 
@@ -64,6 +67,16 @@ public struct SearchPolicy: Sendable {
         } else {
             self.maxCachedResultCount = nil
         }
+    }
+
+    func validated() -> Self {
+        var result = self
+        if case let .ngram(k) = indexStrategy { result.indexStrategy = .ngram(k: min(3, max(2, k))) }
+        if case let .lru(capacity) = cache { result.cache = .lru(capacity: min(10_000, max(1, capacity))) }
+        result.maxQueryLength = maxQueryLength.map { min(4_096, max(1, $0)) }
+        result.maxCandidateScan = maxCandidateScan.map { max(1, $0) }
+        result.maxCachedResultCount = maxCachedResultCount.map { max(1, $0) }
+        return result
     }
 }
 

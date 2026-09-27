@@ -84,7 +84,7 @@ public extension Hangul {
     }
 
     private static func endingSoundInfo(for word: String) -> EndingSoundInfo {
-        let scalars = Array(word.unicodeScalars)
+        let scalars = Array(word.precomposedStringWithCanonicalMapping.unicodeScalars)
         var end = scalars.count
         while end > 0, isIgnorableTail(scalars[end - 1]) {
             end -= 1

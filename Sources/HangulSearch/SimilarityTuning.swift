@@ -17,6 +17,7 @@ public struct SimilarityEvaluationOptions: Sendable {
     public var includeLayoutVariants: Bool
     public var minimumScore: Double
     public var weights: SimilarityWeights
+    public var distanceAlgorithm: SimilarityDistanceAlgorithm
 
     public static let `default` = SimilarityEvaluationOptions()
 
@@ -26,7 +27,8 @@ public struct SimilarityEvaluationOptions: Sendable {
         candidateLimitPerVariant: Int = 300,
         includeLayoutVariants: Bool = true,
         minimumScore: Double = 0.0,
-        weights: SimilarityWeights = .default
+        weights: SimilarityWeights = .default,
+        distanceAlgorithm: SimilarityDistanceAlgorithm = .levenshtein
     ) {
         self.limit = max(1, limit)
         self.ngramSize = max(1, ngramSize)
@@ -34,6 +36,7 @@ public struct SimilarityEvaluationOptions: Sendable {
         self.includeLayoutVariants = includeLayoutVariants
         self.minimumScore = min(1, max(0, minimumScore))
         self.weights = weights
+        self.distanceAlgorithm = distanceAlgorithm
     }
 }
 
@@ -67,6 +70,7 @@ public struct SimilarityTuningOptions: Sendable {
     public var maxCandidates: Int
     public var leaderboardSize: Int
     public var seed: UInt64
+    public var distanceAlgorithm: SimilarityDistanceAlgorithm
 
     public static let `default` = SimilarityTuningOptions()
 
@@ -79,7 +83,8 @@ public struct SimilarityTuningOptions: Sendable {
         minimumScore: Double = 0.0,
         maxCandidates: Int = 80,
         leaderboardSize: Int = 10,
-        seed: UInt64 = 0xD0C0_2026_0219_0001
+        seed: UInt64 = 0xD0C0_2026_0219_0001,
+        distanceAlgorithm: SimilarityDistanceAlgorithm = .levenshtein
     ) {
         self.baseWeights = baseWeights
         self.limit = max(1, limit)
@@ -90,6 +95,7 @@ public struct SimilarityTuningOptions: Sendable {
         self.maxCandidates = max(1, maxCandidates)
         self.leaderboardSize = max(1, leaderboardSize)
         self.seed = seed
+        self.distanceAlgorithm = distanceAlgorithm
     }
 }
 
@@ -111,19 +117,28 @@ public struct SimilarityTuningReport: Sendable {
     public let bestMetrics: SimilarityEvaluationMetrics
     public let evaluatedCandidates: Int
     public let leaderboard: [SimilarityTuningCandidate]
+    public let validationBaselineMetrics: SimilarityEvaluationMetrics?
+    public let validationBestMetrics: SimilarityEvaluationMetrics?
+    public let usedValidationFallback: Bool
 
     public init(
         bestWeights: SimilarityWeights,
         baselineMetrics: SimilarityEvaluationMetrics,
         bestMetrics: SimilarityEvaluationMetrics,
         evaluatedCandidates: Int,
-        leaderboard: [SimilarityTuningCandidate]
+        leaderboard: [SimilarityTuningCandidate],
+        validationBaselineMetrics: SimilarityEvaluationMetrics? = nil,
+        validationBestMetrics: SimilarityEvaluationMetrics? = nil,
+        usedValidationFallback: Bool = false
     ) {
         self.bestWeights = bestWeights
         self.baselineMetrics = baselineMetrics
         self.bestMetrics = bestMetrics
         self.evaluatedCandidates = evaluatedCandidates
         self.leaderboard = leaderboard
+        self.validationBaselineMetrics = validationBaselineMetrics
+        self.validationBestMetrics = validationBestMetrics
+        self.usedValidationFallback = usedValidationFallback
     }
 }
 
@@ -147,8 +162,9 @@ public extension HangulSearchIndex {
             candidateLimitPerVariant: options.candidateLimitPerVariant,
             includeLayoutVariants: options.includeLayoutVariants,
             minimumScore: options.minimumScore,
-            weights: options.weights
-        )
+            weights: options.weights,
+            distanceAlgorithm: options.distanceAlgorithm
+        ).validated()
 
         for sample in samples {
             let ranked = searchSimilar(sample.query, options: searchOptions)
@@ -159,7 +175,7 @@ public extension HangulSearchIndex {
                 if rank < 3 {
                     top3Hits += 1
                 }
-                if rank < options.limit {
+                if rank < searchOptions.limit {
                     hitHits += 1
                 }
                 reciprocalSum += 1.0 / Double(rank + 1)
@@ -180,13 +196,28 @@ public extension HangulSearchIndex {
         samples: [SimilarityTrainingSample],
         options: SimilarityTuningOptions = .default
     ) -> SimilarityTuningReport {
+        tuneSimilarityWeights(samples: samples, validationSamples: [], options: options)
+    }
+
+    func tuneSimilarityWeights(
+        samples: [SimilarityTrainingSample],
+        validationSamples: [SimilarityTrainingSample],
+        options: SimilarityTuningOptions = .default
+    ) -> SimilarityTuningReport {
+        var options = options
+        options.baseWeights = options.baseWeights.sanitized()
+        options.maxCandidates = min(1_024, max(1, options.maxCandidates))
+        options.leaderboardSize = min(options.maxCandidates, max(1, options.leaderboardSize))
+        let heldOut = Set(validationSamples.map { SimilarityDataset.queryIdentity($0.query) })
+        let samples = samples.filter { !heldOut.contains(SimilarityDataset.queryIdentity($0.query)) }
         let baselineEvalOptions = SimilarityEvaluationOptions(
             limit: options.limit,
             ngramSize: options.ngramSize,
             candidateLimitPerVariant: options.candidateLimitPerVariant,
             includeLayoutVariants: options.includeLayoutVariants,
             minimumScore: options.minimumScore,
-            weights: options.baseWeights
+            weights: options.baseWeights,
+            distanceAlgorithm: options.distanceAlgorithm
         )
         let baseline = evaluateSimilarity(samples: samples, options: baselineEvalOptions)
 
@@ -206,22 +237,42 @@ public extension HangulSearchIndex {
                 candidateLimitPerVariant: options.candidateLimitPerVariant,
                 includeLayoutVariants: options.includeLayoutVariants,
                 minimumScore: options.minimumScore,
-                weights: weights
+                weights: weights,
+                distanceAlgorithm: options.distanceAlgorithm
             )
             let metrics = evaluateSimilarity(samples: samples, options: evalOptions)
             evaluated.append(SimilarityTuningCandidate(weights: weights, metrics: metrics))
         }
 
         let sorted = evaluated.sorted(by: Self.isBetterCandidate(_:_:))
-        let best = sorted.first ?? SimilarityTuningCandidate(weights: options.baseWeights, metrics: baseline)
+        var best = sorted.first ?? SimilarityTuningCandidate(weights: options.baseWeights, metrics: baseline)
         let leaderboard = Array(sorted.prefix(options.leaderboardSize))
+        var validationBaseline: SimilarityEvaluationMetrics?
+        var validationBest: SimilarityEvaluationMetrics?
+        var usedFallback = false
+        if !validationSamples.isEmpty {
+            let control = evaluateSimilarity(samples: validationSamples, options: baselineEvalOptions)
+            var validationOptions = baselineEvalOptions
+            validationOptions.weights = best.weights
+            let treatment = evaluateSimilarity(samples: validationSamples, options: validationOptions)
+            validationBaseline = control
+            validationBest = treatment
+            if samples.isEmpty || treatment.objectiveScore < control.objectiveScore {
+                best = .init(weights: options.baseWeights, metrics: baseline)
+                validationBest = control
+                usedFallback = true
+            }
+        }
 
         return SimilarityTuningReport(
             bestWeights: best.weights,
             baselineMetrics: baseline,
             bestMetrics: best.metrics,
             evaluatedCandidates: evaluated.count,
-            leaderboard: leaderboard
+            leaderboard: leaderboard,
+            validationBaselineMetrics: validationBaseline,
+            validationBestMetrics: validationBest,
+            usedValidationFallback: usedFallback
         )
     }
 
@@ -274,7 +325,9 @@ public extension HangulSearchIndex {
         }
 
         var rng = DeterministicRNG(state: seed)
-        while candidates.count < maxCandidates {
+        var attempts = 0
+        while candidates.count < maxCandidates && attempts < maxCandidates * 20 {
+            attempts += 1
             var candidate = base
             candidate.editDistance *= rng.uniform(in: 0.5...1.5)
             candidate.jaccard *= rng.uniform(in: 0.5...1.5)
@@ -289,14 +342,7 @@ public extension HangulSearchIndex {
     }
 
     private static func normalizedWeights(_ weights: SimilarityWeights) -> SimilarityWeights {
-        SimilarityWeights(
-            editDistance: clamp(weights.editDistance, min: 0.01, max: 2.0),
-            jaccard: clamp(weights.jaccard, min: 0.01, max: 2.0),
-            keyboard: clamp(weights.keyboard, min: 0.01, max: 2.0),
-            jamo: clamp(weights.jamo, min: 0.01, max: 2.0),
-            prefixBonus: clamp(weights.prefixBonus, min: 0.0, max: 0.5),
-            exactBonus: clamp(weights.exactBonus, min: 0.0, max: 0.5)
-        )
+        weights.sanitized()
     }
 
     private static func fingerprint(_ weights: SimilarityWeights) -> String {
@@ -311,9 +357,6 @@ public extension HangulSearchIndex {
         )
     }
 
-    private static func clamp(_ value: Double, min: Double, max: Double) -> Double {
-        Swift.max(min, Swift.min(max, value))
-    }
 }
 
 private extension SimilarityWeights {

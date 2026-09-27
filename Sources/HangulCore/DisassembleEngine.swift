@@ -4,9 +4,9 @@ import Foundation
 internal enum DisassembleEngine {
     static func disassemble(_ str: String, options: DisassembleOptions) -> String {
         var result = String()
-        result.reserveCapacity(str.count * 3)
+        result.reserveCapacity(str.utf8.count)
 
-        for scalar in str.unicodeScalars {
+        for scalar in str.precomposedStringWithCanonicalMapping.unicodeScalars {
             if let components = UnicodeHangul.decompose(scalar) {
                 result.append(JamoTables.choseong[components.l])
 
@@ -30,7 +30,8 @@ internal enum DisassembleEngine {
                 continue
             }
 
-            let asString = JamoTables.scalarString(scalar)
+            let jamo = UnicodeHangul.compatibilityJamo(scalar)
+            let asString = jamo ?? JamoTables.scalarString(scalar)
             if options.decomposeDoubleVowels, let split = JamoTables.doubleVowelDecomposition[asString] {
                 result.append(split.0)
                 result.append(split.1)
@@ -43,8 +44,8 @@ internal enum DisassembleEngine {
                 continue
             }
 
-            if options.preserveNonHangul {
-                result.unicodeScalars.append(scalar)
+            if jamo != nil || options.preserveNonHangul {
+                result.append(asString)
             }
         }
 

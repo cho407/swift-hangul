@@ -22,6 +22,7 @@ internal enum AssembleEngine {
             let tIndex = JamoTables.jongseongIndexByJamo[jamo]
 
             if currentL == nil {
+                flushSyllableIfNeeded()
                 if let lIndex {
                     currentL = lIndex
                 } else {
@@ -78,12 +79,6 @@ internal enum AssembleEngine {
                 return
             }
 
-            if currentL == nil {
-                flushSyllableIfNeeded()
-                result.append(jamo)
-                return
-            }
-
             if currentV == nil {
                 currentV = vIndex
                 return
@@ -96,7 +91,7 @@ internal enum AssembleEngine {
                     currentV = composedIndex
                 } else {
                     flushSyllableIfNeeded()
-                    result.append(jamo)
+                    currentV = vIndex
                 }
                 return
             }
@@ -127,7 +122,12 @@ internal enum AssembleEngine {
         }
 
         mutating func flushSyllableIfNeeded() {
-            guard let l = currentL else { return }
+            guard let l = currentL else {
+                if let v = currentV { result.append(JamoTables.jungseong[v]) }
+                currentV = nil
+                currentT = nil
+                return
+            }
 
             if let v = currentV,
                let scalar = UnicodeHangul.compose(l: l, v: v, t: currentT ?? 0) {
@@ -148,22 +148,42 @@ internal enum AssembleEngine {
     }
 
     static func assemble(_ fragments: [String]) -> String {
-        let merged = fragments.joined()
-        var composer = Composer(capacity: merged.count)
+        var composer = Composer(capacity: fragments.reduce(0) { $0 + $1.utf8.count })
 
-        for scalar in merged.unicodeScalars {
-            let token = JamoTables.scalarString(scalar)
-            if JamoTables.choseongIndexByJamo[token] != nil || JamoTables.jongseongIndexByJamo[token] != nil {
-                composer.appendConsonant(token)
-                continue
+        func append(_ token: String) {
+            // Tokens are validated modern jamo; avoid failed dictionary lookups for simple consonants.
+            let value = token.unicodeScalars.first!.value
+            if value >= 0x314F {
+                if let split = JamoTables.doubleVowelDecomposition[token] {
+                    composer.appendVowel(split.0)
+                    composer.appendVowel(split.1)
+                } else {
+                    composer.appendVowel(token)
+                }
+            } else {
+                switch value {
+                case 0x3133, 0x3135...0x3136, 0x313A...0x3140, 0x3144:
+                    let split = JamoTables.doubleFinalDecomposition[token]!
+                    composer.appendConsonant(split.0)
+                    composer.appendConsonant(split.1)
+                default:
+                    composer.appendConsonant(token)
+                }
             }
+        }
 
-            if JamoTables.jungseongIndexByJamo[token] != nil {
-                composer.appendVowel(token)
-                continue
+        for fragment in fragments {
+            for scalar in fragment.unicodeScalars {
+                if let parts = UnicodeHangul.decompose(scalar) {
+                    append(JamoTables.choseong[parts.l])
+                    append(JamoTables.jungseong[parts.v])
+                    if parts.t > 0 { append(JamoTables.jongseong[parts.t]) }
+                } else if let jamo = UnicodeHangul.compatibilityJamo(scalar) {
+                    append(jamo)
+                } else {
+                    composer.appendRaw(scalar)
+                }
             }
-
-            composer.appendRaw(scalar)
         }
 
         return composer.finalize()

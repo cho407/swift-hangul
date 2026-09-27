@@ -36,7 +36,8 @@ public final class HangulSearchIndex<Item: Sendable>: @unchecked Sendable {
     private struct SimilarityCandidate {
         let index: Int
         let coarseScore: Double
-        let isStrong: Bool
+        let priority: Int
+        let length: Int
     }
 
     private struct RankedSimilarEntry {
@@ -67,6 +68,7 @@ public final class HangulSearchIndex<Item: Sendable>: @unchecked Sendable {
     }
 
     public init(items: [Item], keyPath: KeyPath<Item, String>, policy: SearchPolicy = .default) {
+        let policy = policy.validated()
         self.items = items
         self.rawKeys = items.map { $0[keyPath: keyPath] }
         self.normalizedRawKeys = self.rawKeys.map(Self.normalizedSearchToken)
@@ -336,6 +338,7 @@ public final class HangulSearchIndex<Item: Sendable>: @unchecked Sendable {
         _ query: String,
         options: SimilarityOptions = .default
     ) -> [ScoredSearchResult<Item>] {
+        let options = options.validated()
         let startedAt = DispatchTime.now().uptimeNanoseconds
         var output: [ScoredSearchResult<Item>] = []
 
@@ -367,6 +370,7 @@ public final class HangulSearchIndex<Item: Sendable>: @unchecked Sendable {
         _ query: String,
         options: SimilarityOptions = .default
     ) async throws -> [ScoredSearchResult<Item>] {
+        let options = options.validated()
         let startedAt = DispatchTime.now().uptimeNanoseconds
 
         do {
@@ -411,6 +415,7 @@ public final class HangulSearchIndex<Item: Sendable>: @unchecked Sendable {
         _ query: String,
         options: SimilarityOptions = .default
     ) -> [ExplainedSearchResult<Item>] {
+        let options = options.validated()
         let startedAt = DispatchTime.now().uptimeNanoseconds
         var output: [ExplainedSearchResult<Item>] = []
 
@@ -442,6 +447,7 @@ public final class HangulSearchIndex<Item: Sendable>: @unchecked Sendable {
         _ query: String,
         options: SimilarityOptions = .default
     ) async throws -> [ExplainedSearchResult<Item>] {
+        let options = options.validated()
         let startedAt = DispatchTime.now().uptimeNanoseconds
 
         do {
@@ -467,7 +473,8 @@ public final class HangulSearchIndex<Item: Sendable>: @unchecked Sendable {
                 options: options,
                 cancellationCheck: { try Task.checkCancellation() }
             )
-            let output = makeExplainedResults(from: ranked, choseongKeys: choseongKeys, options: options)
+            let output = try makeExplainedResults(from: ranked, choseongKeys: choseongKeys, options: options,
+                                                 cancellationCheck: { try Task.checkCancellation() })
             telemetry.recordAsyncExplainSuccess(
                 latencyNs: Self.elapsedNanoseconds(since: startedAt),
                 resultCount: output.count
@@ -589,13 +596,10 @@ public final class HangulSearchIndex<Item: Sendable>: @unchecked Sendable {
         options: SimilarityOptions,
         cancellationCheck: (() throws -> Void)?
     ) rethrows -> [SimilarityCandidate] {
-        let lookupQuery = choseongQuery.isEmpty ? variant : choseongQuery
-        let matchTarget: QueryMatchTarget = choseongQuery.isEmpty ? .raw : .choseong
-        let normalizedLookup = Self.normalizedSearchToken(lookupQuery)
-        let base = candidateIndicesForSearch(
-            query: normalizedLookup,
-            compactedQuery: Self.compactedSearchToken(normalizedLookup),
-            target: matchTarget
+        let base = try fuzzyCandidateIndices(
+            query: variant, choseong: choseongQuery,
+            minimumCount: max(options.candidateLimitPerVariant, options.limit * 10),
+            cancellationCheck: cancellationCheck
         )
 
         let targetCandidateCount = min(
@@ -603,7 +607,7 @@ public final class HangulSearchIndex<Item: Sendable>: @unchecked Sendable {
             max(options.candidateLimitPerVariant, max(1, options.limit) * 10)
         )
         guard base.count > targetCandidateCount else {
-            return base.map { SimilarityCandidate(index: $0, coarseScore: 1, isStrong: true) }
+            return base.map { SimilarityCandidate(index: $0, coarseScore: 1, priority: 0, length: 0) }
         }
 
         return try prefilterCandidates(
@@ -616,6 +620,29 @@ public final class HangulSearchIndex<Item: Sendable>: @unchecked Sendable {
         )
     }
 
+    private func fuzzyCandidateIndices(
+        query: String, choseong: String, minimumCount: Int,
+        cancellationCheck: (() throws -> Void)?
+    ) rethrows -> [Int] {
+        guard case let .ngram(k) = policy.indexStrategy else {
+            return applyCandidateScanLimit(allIndices)
+        }
+        let compacted = Self.compactedSearchToken(Self.normalizedSearchToken(query))
+        // Fuzzy retrieval needs a union, not the direct-match intersection.
+        // Short queries and sparse postings fall back to a bounded scan.
+        guard compacted.unicodeScalars.count >= k else { return applyCandidateScanLimit(allIndices) }
+        var candidates: [Int] = []
+        for (token, index) in [(compacted, ngramRawCompactedIndex), (choseong, ngramChoseongIndex)] {
+            for gram in Set(Self.makeNgrams(text: token, k: k)) {
+                try cancellationCheck?()
+                if let posting = index?[gram] {
+                    candidates = Self.sortedUnion(candidates, posting)
+                }
+            }
+        }
+        return applyCandidateScanLimit(candidates.count < minimumCount ? allIndices : candidates)
+    }
+
     private func prefilterCandidates(
         base: [Int],
         variant: String,
@@ -624,77 +651,47 @@ public final class HangulSearchIndex<Item: Sendable>: @unchecked Sendable {
         limit: Int,
         cancellationCheck: (() throws -> Void)?
     ) rethrows -> [SimilarityCandidate] {
-        let normalizedQuery = Self.normalizedSearchToken(variant)
+        let normalizedQuery = Self.compactedSearchToken(Self.normalizedSearchToken(variant))
         let normalizedChoseongQuery = Self.normalizedSearchToken(choseongQuery)
+        let choseongOnly = Self.isChoseongOnlyQuery(normalizedQuery)
 
-        var strong: [SimilarityCandidate] = []
-        strong.reserveCapacity(min(limit, base.count))
-
-        var coarse: [SimilarityCandidate] = []
-        coarse.reserveCapacity(min(base.count, limit * 2))
+        let preparedCoarse = SimilarityScorer.CoarseQuery(normalizedChoseongQuery.isEmpty ? normalizedQuery : normalizedChoseongQuery)
+        var candidates = BoundedTopK<SimilarityCandidate>(capacity: limit) {
+            if $0.priority != $1.priority { return $0.priority > $1.priority }
+            if $0.priority > 0, $0.length != $1.length { return $0.length < $1.length }
+            if $0.coarseScore != $1.coarseScore { return $0.coarseScore > $1.coarseScore }
+            return $0.index < $1.index
+        }
 
         for (offset, index) in base.enumerated() {
             if offset % 64 == 0 {
                 try cancellationCheck?()
             }
 
-            let key = normalizedRawKeys[index]
+            let key = normalizedCompactedRawKeys[index]
             let choseongKey = normalizedChoseongKeys[index]
 
             let strongRaw = !normalizedQuery.isEmpty && (
                 key == normalizedQuery || key.hasPrefix(normalizedQuery) || key.contains(normalizedQuery)
             )
 
-            let strongChoseong = !normalizedChoseongQuery.isEmpty && (
+            let strongChoseong = choseongOnly && !normalizedChoseongQuery.isEmpty && (
                 choseongKey == normalizedChoseongQuery ||
                 choseongKey.hasPrefix(normalizedChoseongQuery) ||
                 choseongKey.contains(normalizedChoseongQuery)
             )
 
             if strongRaw || strongChoseong {
-                strong.append(SimilarityCandidate(index: index, coarseScore: 1, isStrong: true))
+                candidates.insert(.init(index: index, coarseScore: 1,
+                                        priority: key == normalizedQuery ? 2 : 1, length: key.unicodeScalars.count))
                 continue
             }
 
-            let score = SimilarityScorer.coarseSimilarity(
-                query: normalizedQuery,
-                choseongQuery: normalizedChoseongQuery,
-                key: key,
-                choseongKey: choseongKey
-            )
-            if score > 0 {
-                coarse.append(SimilarityCandidate(index: index, coarseScore: score, isStrong: false))
-            }
+            let score = preparedCoarse.score(normalizedChoseongQuery.isEmpty ? key : choseongKey)
+            candidates.insert(.init(index: index, coarseScore: score, priority: 0, length: key.unicodeScalars.count))
         }
 
-        strong.sort {
-            if normalizedRawKeys[$0.index].count == normalizedRawKeys[$1.index].count {
-                return $0.index < $1.index
-            }
-            return normalizedRawKeys[$0.index].count < normalizedRawKeys[$1.index].count
-        }
-
-        if strong.count >= limit {
-            return Array(strong.prefix(limit))
-        }
-
-        coarse.sort { lhs, rhs in
-            if lhs.coarseScore == rhs.coarseScore {
-                return lhs.index < rhs.index
-            }
-            return lhs.coarseScore > rhs.coarseScore
-        }
-
-        let remaining = limit - strong.count
-        var result = strong
-        result.reserveCapacity(limit)
-        result.append(contentsOf: coarse.prefix(remaining))
-
-        if result.isEmpty {
-            return Array(base.prefix(limit)).map { SimilarityCandidate(index: $0, coarseScore: 0, isStrong: false) }
-        }
-
-        return result
+        return candidates.sorted()
     }
 
     private func computeVariantScores(
@@ -706,7 +703,7 @@ public final class HangulSearchIndex<Item: Sendable>: @unchecked Sendable {
         initialScoreGate: Double,
         cancellationCheck: (() throws -> Void)?
     ) rethrows -> [(index: Int, breakdown: SimilarityScoreBreakdown)] {
-        let coarseCutoff = max(0.05, initialScoreGate * 0.6)
+        let preparedQuery = SimilarityScorer.prepareQuery(variant, choseong: choseongQuery, options: options)
 
         if cancellationCheck == nil {
             let workerCount = min(
@@ -715,71 +712,45 @@ public final class HangulSearchIndex<Item: Sendable>: @unchecked Sendable {
             )
             if workerCount > 1 {
                 return computeVariantScoresParallel(
-                    variant: variant,
-                    choseongQuery: choseongQuery,
+                    preparedQuery: preparedQuery,
                     normalizedChoseongKeys: normalizedChoseongKeys,
                     candidates: candidates,
                     options: options,
-                    coarseCutoff: coarseCutoff,
                     workerCount: workerCount
                 )
             }
         }
 
-        var entries: [(index: Int, breakdown: SimilarityScoreBreakdown)] = []
-        entries.reserveCapacity(min(candidates.count, max(1, options.limit) * 4))
-        var localScoreGate = initialScoreGate
-        let localTrimTarget = max(max(1, options.limit) * 4, 128)
+        var entries = Self.scoreHeap(limit: options.limit)
 
         for (offset, candidate) in candidates.enumerated() {
             if offset % 16 == 0 {
                 try cancellationCheck?()
             }
 
-            if !candidate.isStrong && candidate.coarseScore < coarseCutoff {
-                continue
-            }
-
-            let breakdown = SimilarityScorer.score(
-                query: variant,
+            let breakdown = try SimilarityScorer.score(
+                query: preparedQuery,
                 target: rawKeys[candidate.index],
-                queryChoseong: choseongQuery,
                 targetChoseong: normalizedChoseongKeys[candidate.index],
-                options: options
+                options: options,
+                cancellationCheck: cancellationCheck
             )
 
             let total = breakdown.totalScore
-            if total < options.minimumScore || total < localScoreGate {
+            if total < options.minimumScore || total < initialScoreGate {
                 continue
             }
-            entries.append((candidate.index, breakdown))
-
-            if entries.count > localTrimTarget {
-                entries.sort {
-                    if $0.breakdown.totalScore == $1.breakdown.totalScore {
-                        return $0.index < $1.index
-                    }
-                    return $0.breakdown.totalScore > $1.breakdown.totalScore
-                }
-                entries.removeSubrange(localTrimTarget..<entries.count)
-            }
-
-            localScoreGate = max(
-                initialScoreGate,
-                kthScore(entries: entries, k: max(1, options.limit), minimum: options.minimumScore)
-            )
+            entries.insert((candidate.index, breakdown))
         }
 
-        return entries
+        return entries.sorted()
     }
 
     private func computeVariantScoresParallel(
-        variant: String,
-        choseongQuery: String,
+        preparedQuery: SimilarityScorer.QueryFeatures,
         normalizedChoseongKeys: [String],
         candidates: [SimilarityCandidate],
         options: SimilarityOptions,
-        coarseCutoff: Double,
         workerCount: Int
     ) -> [(index: Int, breakdown: SimilarityScoreBreakdown)] {
         let chunkSize = (candidates.count + workerCount - 1) / workerCount
@@ -792,33 +763,33 @@ public final class HangulSearchIndex<Item: Sendable>: @unchecked Sendable {
             }
 
             let end = min(candidates.count, start + chunkSize)
-            var local: [(index: Int, breakdown: SimilarityScoreBreakdown)] = []
-            local.reserveCapacity(end - start)
+            var local = Self.scoreHeap(limit: options.limit)
 
             for i in start..<end {
                 let candidate = candidates[i]
-                if !candidate.isStrong && candidate.coarseScore < coarseCutoff {
-                    continue
-                }
-
                 let breakdown = SimilarityScorer.score(
-                    query: variant,
+                    query: preparedQuery,
                     target: rawKeys[candidate.index],
-                    queryChoseong: choseongQuery,
                     targetChoseong: normalizedChoseongKeys[candidate.index],
                     options: options
                 )
 
                 if breakdown.totalScore >= options.minimumScore {
-                    local.append((candidate.index, breakdown))
+                    local.insert((candidate.index, breakdown))
                 }
             }
 
-            guard !local.isEmpty else { return }
-            collector.append(local)
+            collector.append(local.sorted())
         }
 
         return collector.snapshot()
+    }
+
+    private static func scoreHeap(limit: Int) -> BoundedTopK<(index: Int, breakdown: SimilarityScoreBreakdown)> {
+        BoundedTopK(capacity: limit) {
+            if $0.breakdown.totalScore == $1.breakdown.totalScore { return $0.index < $1.index }
+            return $0.breakdown.totalScore > $1.breakdown.totalScore
+        }
     }
 
     private func trimBestScores(
@@ -885,8 +856,9 @@ public final class HangulSearchIndex<Item: Sendable>: @unchecked Sendable {
     private func makeExplainedResults(
         from ranked: [RankedSimilarEntry],
         choseongKeys: [String],
-        options: SimilarityOptions
-    ) -> [ExplainedSearchResult<Item>] {
+        options: SimilarityOptions,
+        cancellationCheck: (() throws -> Void)? = nil
+    ) rethrows -> [ExplainedSearchResult<Item>] {
         var results: [ExplainedSearchResult<Item>] = []
         results.reserveCapacity(ranked.count)
 
@@ -894,12 +866,13 @@ public final class HangulSearchIndex<Item: Sendable>: @unchecked Sendable {
             let queryChoseong = Self.normalizedSearchToken(
                 Hangul.getChoseong(entry.variant, options: policy.choseongOptions)
             )
-            let explained = SimilarityScorer.explain(
+            let explained = try SimilarityScorer.explain(
                 query: entry.variant,
                 target: rawKeys[entry.index],
                 queryChoseong: queryChoseong,
                 targetChoseong: choseongKeys[entry.index],
-                options: options
+                options: options,
+                cancellationCheck: cancellationCheck
             )
             results.append(
                 ExplainedSearchResult(
@@ -934,17 +907,16 @@ public final class HangulSearchIndex<Item: Sendable>: @unchecked Sendable {
         guard let maxQueryLength = policy.maxQueryLength else {
             return query
         }
-        guard query.count > maxQueryLength else {
-            return query
-        }
-        return String(query.prefix(maxQueryLength))
+        // A single grapheme can contain arbitrarily many combining scalars.
+        let scalarBounded = String(String.UnicodeScalarView(query.unicodeScalars.prefix(maxQueryLength * 4)))
+        return String(scalarBounded.precomposedStringWithCanonicalMapping.prefix(maxQueryLength))
     }
 
     private func boundedSearchQueryContext(_ query: String) -> SearchQueryContext {
         let bounded = boundedRawQuery(query)
         let normalizedRaw = Self.normalizedSearchToken(bounded)
         let compactedRaw = Self.compactedSearchToken(normalizedRaw)
-        guard !normalizedRaw.isEmpty else {
+        guard !compactedRaw.isEmpty else {
             return SearchQueryContext(normalizedQuery: "", normalizedCompactedQuery: "", target: .raw)
         }
 
@@ -1058,6 +1030,9 @@ public final class HangulSearchIndex<Item: Sendable>: @unchecked Sendable {
             }
             return list
         case .raw:
+            if !compactedQuery.isEmpty, compactedQuery.unicodeScalars.count < k {
+                return allIndices
+            }
             var union: [Int] = []
             var hasAnyList = false
 

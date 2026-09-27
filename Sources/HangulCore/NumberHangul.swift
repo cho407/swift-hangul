@@ -181,6 +181,28 @@ public extension Hangul {
     }
 
     private static func parseDecimalNumber(_ input: String) -> ParsedDecimalNumber? {
+        if let separator = input.firstIndex(where: { $0 == "e" || $0 == "E" }) {
+            // Bound expansion before allocating zeros for an untrusted exponent.
+            guard input.utf8.count <= 4_096,
+                  let exponent = Int(input[input.index(after: separator)...]),
+                  (-4_096...4_096).contains(exponent),
+                  let mantissa = parseDecimalNumber(String(input[..<separator])) else { return nil }
+            let digits = mantissa.integerDigits + mantissa.fractionDigits
+            let point = mantissa.integerDigits.utf8.count + exponent
+            guard digits.utf8.count + abs(exponent) <= 4_096 else { return nil }
+            if point <= 0 {
+                return .init(negative: mantissa.negative, integerDigits: "0",
+                             fractionDigits: String(repeating: "0", count: -point) + digits)
+            }
+            if point >= digits.utf8.count {
+                return .init(negative: mantissa.negative,
+                             integerDigits: digits + String(repeating: "0", count: point - digits.utf8.count),
+                             fractionDigits: "")
+            }
+            let split = digits.index(digits.startIndex, offsetBy: point)
+            return .init(negative: mantissa.negative, integerDigits: String(digits[..<split]),
+                         fractionDigits: String(digits[split...]))
+        }
         var negative = false
         var seenSign = false
         var seenDot = false
@@ -249,7 +271,7 @@ public extension Hangul {
         var index = 0
         var end = normalized.endIndex
         while end > normalized.startIndex {
-            let start = normalized.index(end, offsetBy: -min(4, normalized.distance(from: normalized.startIndex, to: end)))
+            let start = normalized.index(end, offsetBy: -4, limitedBy: normalized.startIndex) ?? normalized.startIndex
             let chunk = String(normalized[start..<end])
             if let groupHangul = convert4Digits(chunk), !groupHangul.isEmpty {
                 groups.append(groupHangul + largeUnit(at: index))
@@ -271,7 +293,7 @@ public extension Hangul {
         var index = 0
         var end = normalized.endIndex
         while end > normalized.startIndex {
-            let start = normalized.index(end, offsetBy: -min(4, normalized.distance(from: normalized.startIndex, to: end)))
+            let start = normalized.index(end, offsetBy: -4, limitedBy: normalized.startIndex) ?? normalized.startIndex
             let chunk = String(normalized[start..<end])
             if let value = Int(chunk), value != 0 {
                 groups.append("\(formatWithComma(value))\(largeUnit(at: index))")

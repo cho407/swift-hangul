@@ -90,7 +90,7 @@ public enum Hangul {
         var result: [[String]] = []
         result.reserveCapacity(str.count)
 
-        for scalar in str.unicodeScalars {
+        for scalar in str.precomposedStringWithCanonicalMapping.unicodeScalars {
             if let components = UnicodeHangul.decompose(scalar) {
                 var group: [String] = []
                 group.reserveCapacity(4)
@@ -117,7 +117,8 @@ public enum Hangul {
                 continue
             }
 
-            let token = JamoTables.scalarString(scalar)
+            let jamo = UnicodeHangul.compatibilityJamo(scalar)
+            let token = jamo ?? JamoTables.scalarString(scalar)
             if options.decomposeDoubleVowels, let split = JamoTables.doubleVowelDecomposition[token] {
                 result.append([split.0, split.1])
                 continue
@@ -128,7 +129,7 @@ public enum Hangul {
                 continue
             }
 
-            if options.preserveNonHangul {
+            if jamo != nil || options.preserveNonHangul {
                 result.append([token])
             }
         }
@@ -147,8 +148,8 @@ public enum Hangul {
             return choseong + jungseong + jongseong
         }
 
-        let finalToken = canonicalJongseongToken(jongseong) ?? ""
-        guard let tIndex = JamoTables.jongseongIndexByJamo[finalToken],
+        guard let finalToken = canonicalJongseongToken(jongseong),
+              let tIndex = JamoTables.jongseongIndexByJamo[finalToken],
               let scalar = UnicodeHangul.compose(l: lIndex, v: vIndex, t: tIndex) else {
             return choseong + jungseong + jongseong
         }
@@ -163,8 +164,8 @@ public enum Hangul {
             throw HangulCoreError.invalidHangulComponents(choseong: choseong, jungseong: jungseong, jongseong: jongseong)
         }
 
-        let finalToken = canonicalJongseongToken(jongseong) ?? ""
-        guard let tIndex = JamoTables.jongseongIndexByJamo[finalToken],
+        guard let finalToken = canonicalJongseongToken(jongseong),
+              let tIndex = JamoTables.jongseongIndexByJamo[finalToken],
               let scalar = UnicodeHangul.compose(l: lIndex, v: vIndex, t: tIndex) else {
             throw HangulCoreError.invalidHangulComponents(choseong: choseong, jungseong: jungseong, jongseong: jongseong)
         }
@@ -189,7 +190,8 @@ public enum Hangul {
     }
 
     public static func disassembleCompleteCharacter(_ character: String) -> HangulCharacterComponents? {
-        guard character.count == 1, let scalar = character.unicodeScalars.first,
+        let normalized = character.precomposedStringWithCanonicalMapping
+        guard normalized.unicodeScalars.count == 1, let scalar = normalized.unicodeScalars.first,
               let components = UnicodeHangul.decompose(scalar) else {
             return nil
         }
@@ -203,19 +205,20 @@ public enum Hangul {
 
     public static func getChoseong(_ str: String, options: ChoseongOptions = .default) -> String {
         var result = String()
-        result.reserveCapacity(str.count)
+        result.reserveCapacity(str.utf8.count)
 
         var previousWasWhitespace = false
 
-        for scalar in str.unicodeScalars {
+        for scalar in str.precomposedStringWithCanonicalMapping.unicodeScalars {
             if let components = UnicodeHangul.decompose(scalar) {
                 result.append(JamoTables.choseong[components.l])
                 previousWasWhitespace = false
                 continue
             }
 
-            if JamoTables.isCompatibilityConsonant(scalar) {
-                result.unicodeScalars.append(scalar)
+            if let jamo = UnicodeHangul.compatibilityJamo(scalar),
+               JamoTables.compatibilityConsonants.contains(jamo) {
+                result.append(jamo)
                 previousWasWhitespace = false
                 continue
             }
@@ -251,7 +254,7 @@ public enum Hangul {
         var result = String()
         result.reserveCapacity(str.count)
 
-        for scalar in str.unicodeScalars {
+        for scalar in str.precomposedStringWithCanonicalMapping.unicodeScalars {
             if let components = UnicodeHangul.decompose(scalar) {
                 result.append(JamoTables.choseong[components.l])
                 continue
@@ -263,8 +266,9 @@ public enum Hangul {
                 continue
             }
 
-            if JamoTables.isCompatibilityConsonant(scalar) {
-                result.unicodeScalars.append(scalar)
+            if let jamo = UnicodeHangul.compatibilityJamo(scalar),
+               JamoTables.compatibilityConsonants.contains(jamo) {
+                result.append(jamo)
                 continue
             }
 
@@ -277,7 +281,7 @@ public enum Hangul {
     }
 
     public static func hasBatchim(_ word: String, options: BatchimOptions = .default) -> Bool {
-        for scalar in word.unicodeScalars.reversed() {
+        for scalar in word.precomposedStringWithCanonicalMapping.unicodeScalars.reversed() {
             if scalar.properties.isWhitespace { continue }
 
             if options.strictCompleteSyllableOnly && UnicodeHangul.decompose(scalar) == nil {
@@ -298,7 +302,7 @@ public enum Hangul {
                 }
             }
 
-            let token = JamoTables.scalarString(scalar)
+            let token = UnicodeHangul.compatibilityJamo(scalar) ?? JamoTables.scalarString(scalar)
             if let normalized = canonicalJongseongToken(token),
                let tIndex = JamoTables.jongseongIndexByJamo[normalized] {
                 guard tIndex > 0 else { return false }
@@ -319,8 +323,9 @@ public enum Hangul {
     }
 
     public static func removeLastCharacter(_ str: String) -> String {
-        guard let last = str.last else { return str }
-        let prefix = String(str.dropLast())
+        let normalized = str.precomposedStringWithCanonicalMapping
+        guard let last = normalized.last else { return str }
+        let prefix = String(normalized.dropLast())
 
         guard let scalar = last.unicodeScalars.first,
               UnicodeHangul.isModernHangulSyllable(scalar),

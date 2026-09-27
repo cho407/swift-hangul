@@ -94,7 +94,7 @@ public extension SimilarityWeights {
     }
 
     private static func clamp(_ value: Double, min: Double, max: Double) -> Double {
-        Swift.max(min, Swift.min(max, value))
+        value.isFinite ? Swift.max(min, Swift.min(max, value)) : min
     }
 }
 

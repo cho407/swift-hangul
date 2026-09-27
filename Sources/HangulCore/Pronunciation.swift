@@ -67,11 +67,11 @@ public extension Hangul {
             return ""
         }
 
-        if let exception = pronunciationExceptions[input] {
+        let normalized = input.precomposedStringWithCanonicalMapping
+        if let exception = pronunciationExceptions[normalized] {
             return exception
         }
 
-        let normalized = input.precomposedStringWithCanonicalMapping
         var units = normalized.unicodeScalars.map { scalar -> SyllableUnit in
             if let parts = UnicodeHangul.decompose(scalar) {
                 return .hangul(.init(l: parts.l, v: parts.v, t: parts.t))
@@ -79,9 +79,7 @@ public extension Hangul {
             return .other(String(scalar))
         }
 
-        guard units.count > 1 else { return normalized }
-
-        for i in 0..<(units.count - 1) {
+        for i in units.indices.dropLast() {
             guard case var .hangul(current) = units[i],
                   case var .hangul(next) = units[i + 1] else {
                 continue

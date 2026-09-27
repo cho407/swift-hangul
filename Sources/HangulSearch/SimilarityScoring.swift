@@ -36,12 +36,16 @@ public struct SimilarityWeights: Codable, Sendable, Equatable {
 }
 
 public struct SimilarityOptions: Codable, Sendable, Equatable {
+    /// Effective result count is clamped to 1...10,000 at the search boundary.
     public var limit: Int
     public var ngramSize: Int
+    /// Clamped to 1...100,000; retrieval retains at least limit * 10 candidates when available.
     public var candidateLimitPerVariant: Int
     public var includeLayoutVariants: Bool
     public var minimumScore: Double
     public var weights: SimilarityWeights
+    /// Defaults to Levenshtein, including when decoding older option files.
+    public var distanceAlgorithm: SimilarityDistanceAlgorithm
 
     public static let `default` = SimilarityOptions()
 
@@ -51,7 +55,8 @@ public struct SimilarityOptions: Codable, Sendable, Equatable {
         candidateLimitPerVariant: Int = 1_200,
         includeLayoutVariants: Bool = true,
         minimumScore: Double = 0.2,
-        weights: SimilarityWeights = .default
+        weights: SimilarityWeights = .default,
+        distanceAlgorithm: SimilarityDistanceAlgorithm = .levenshtein
     ) {
         self.limit = limit
         self.ngramSize = max(1, ngramSize)
@@ -59,6 +64,34 @@ public struct SimilarityOptions: Codable, Sendable, Equatable {
         self.includeLayoutVariants = includeLayoutVariants
         self.minimumScore = min(1, max(0, minimumScore))
         self.weights = weights
+        self.distanceAlgorithm = distanceAlgorithm
+    }
+
+    func validated() -> Self {
+        var result = self
+        result.limit = min(10_000, max(1, limit))
+        result.ngramSize = min(3, max(1, ngramSize))
+        result.candidateLimitPerVariant = min(100_000, max(1, candidateLimitPerVariant))
+        result.minimumScore = minimumScore.isFinite ? min(1, max(0, minimumScore)) : 0.2
+        result.weights = weights.sanitized()
+        return result
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case limit, ngramSize, candidateLimitPerVariant, includeLayoutVariants, minimumScore, weights, distanceAlgorithm
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            limit: try values.decode(Int.self, forKey: .limit),
+            ngramSize: try values.decode(Int.self, forKey: .ngramSize),
+            candidateLimitPerVariant: try values.decode(Int.self, forKey: .candidateLimitPerVariant),
+            includeLayoutVariants: try values.decode(Bool.self, forKey: .includeLayoutVariants),
+            minimumScore: try values.decode(Double.self, forKey: .minimumScore),
+            weights: try values.decode(SimilarityWeights.self, forKey: .weights),
+            distanceAlgorithm: try values.decodeIfPresent(SimilarityDistanceAlgorithm.self, forKey: .distanceAlgorithm) ?? .levenshtein
+        )
     }
 }
 
@@ -186,365 +219,192 @@ public struct ExplainedSearchResult<Item> {
     }
 }
 
+extension ScoredSearchResult: Sendable where Item: Sendable {}
+extension ExplainedSearchResult: Sendable where Item: Sendable {}
+
 enum SimilarityScorer {
+    struct QueryFeatures: Sendable {
+        let text: String
+        let choseong: String
+        let jamo: String
+        let scalars: [UnicodeScalar]
+        let jamoScalars: [UnicodeScalar]
+        let keyboard: [UnicodeScalar]
+        let grams: Set<String>
+        let choseongOnly: Bool
+    }
+
     static func queryVariants(for query: String, includeLayoutVariants: Bool) -> [String] {
         var seen: Set<String> = []
         var variants: [String] = []
-        variants.reserveCapacity(3)
-
-        func appendVariant(_ value: String) {
-            let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !normalized.isEmpty else { return }
-            if seen.insert(normalized).inserted {
-                variants.append(normalized)
-            }
+        func append(_ text: String) {
+            let token = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !token.isEmpty, seen.insert(token).inserted { variants.append(token) }
         }
-
-        appendVariant(query)
+        append(query)
         if includeLayoutVariants {
-            appendVariant(Hangul.convertQwertyToHangul(query))
-            appendVariant(Hangul.convertHangulToQwerty(query))
+            append(Hangul.convertQwertyToHangul(query))
+            append(Hangul.convertHangulToQwerty(query))
         }
-
         return variants
     }
 
+    static func prepareQuery(_ query: String, choseong: String, options: SimilarityOptions) -> QueryFeatures {
+        let text = canonical(query)
+        let onset = canonical(choseong)
+        let onsetOnly = !text.isEmpty && text.unicodeScalars.allSatisfy {
+            (0x3131...0x314E).contains($0.value) || (0x1100...0x1112).contains($0.value)
+                || (0xFFA1...0xFFBE).contains($0.value)
+        }
+        let comparison = onsetOnly ? onset : text
+        let jamo = onsetOnly ? onset : Hangul.disassemble(text)
+        let scalars = Array(comparison.unicodeScalars)
+        return QueryFeatures(text: text, choseong: onset, jamo: jamo, scalars: scalars,
+                             jamoScalars: Array(jamo.unicodeScalars), keyboard: keyboardScalars(comparison),
+                             grams: ngramSet(scalars, n: options.ngramSize), choseongOnly: onsetOnly)
+    }
+
     static func score(
-        query: String,
-        target: String,
-        queryChoseong: String,
-        targetChoseong: String,
+        query: QueryFeatures, target: String, targetChoseong: String,
+        options: SimilarityOptions, cancellationCheck: (() throws -> Void)? = nil
+    ) rethrows -> SimilarityScoreBreakdown {
+        try calculate(query: query, target: target, targetChoseong: targetChoseong,
+                      options: options, includeDetail: false, cancellationCheck: cancellationCheck).breakdown
+    }
+
+    static func score(
+        query: String, target: String, queryChoseong: String, targetChoseong: String,
         options: SimilarityOptions
     ) -> SimilarityScoreBreakdown {
-        let explained = explain(
-            query: query,
-            target: target,
-            queryChoseong: queryChoseong,
-            targetChoseong: targetChoseong,
-            options: options
-        )
-        return explained.breakdown
+        score(query: prepareQuery(query, choseong: queryChoseong, options: options),
+              target: target, targetChoseong: targetChoseong, options: options)
     }
 
     static func explain(
-        query: String,
-        target: String,
-        queryChoseong: String,
-        targetChoseong: String,
-        options: SimilarityOptions
-    ) -> (breakdown: SimilarityScoreBreakdown, detail: SimilarityExplanationDetail) {
-        let lhs = canonical(query)
+        query: String, target: String, queryChoseong: String, targetChoseong: String,
+        options: SimilarityOptions, cancellationCheck: (() throws -> Void)? = nil
+    ) rethrows -> (breakdown: SimilarityScoreBreakdown, detail: SimilarityExplanationDetail) {
+        let result = try calculate(query: prepareQuery(query, choseong: queryChoseong, options: options),
+                                   target: target, targetChoseong: targetChoseong, options: options,
+                                   includeDetail: true, cancellationCheck: cancellationCheck)
+        return (result.breakdown, result.detail!)
+    }
+
+    private static func calculate(
+        query: QueryFeatures, target: String, targetChoseong: String,
+        options: SimilarityOptions, includeDetail: Bool, cancellationCheck: (() throws -> Void)?
+    ) rethrows -> (breakdown: SimilarityScoreBreakdown, detail: SimilarityExplanationDetail?) {
+        try cancellationCheck?()
         let rhs = canonical(target)
-        if lhs.isEmpty || rhs.isEmpty {
-            let emptyDetail = SimilarityExplanationDetail(
-                normalizedQuery: lhs,
-                normalizedTarget: rhs,
-                choseongQuery: "",
-                choseongTarget: "",
-                jamoQuery: "",
-                jamoTarget: "",
-                editDistance: max(lhs.count, rhs.count),
-                jamoEditDistance: 0,
-                keyboardDistance: Double(max(lhs.count, rhs.count)),
-                jaccardIntersectionCount: 0,
-                jaccardUnionCount: 0
-            )
-            return (SimilarityScoreBreakdown(totalScore: 0), emptyDetail)
-        }
-
-        let choseongLHS = queryChoseong.isEmpty ? lhs : canonical(queryChoseong)
-        let choseongRHS = targetChoseong.isEmpty ? rhs : canonical(targetChoseong)
-
-        let editDistance = levenshteinDistance(lhs, rhs)
-        let editSimilarity = normalizedSimilarity(distance: editDistance, maxLength: max(lhs.count, rhs.count))
-
-        let jaccardStats = jaccardNgramStats(choseongLHS, choseongRHS, n: options.ngramSize)
-        let keyboard = keyboardProximityStats(lhs, rhs)
-        let jamoStats = jamoStats(lhs, rhs)
-
+        let onset = canonical(targetChoseong)
+        let comparison = query.choseongOnly ? onset : rhs
+        let targetScalars = Array(comparison.unicodeScalars)
+        let targetJamo = query.choseongOnly ? onset : Hangul.disassemble(rhs)
+        let jamoScalars = Array(targetJamo.unicodeScalars)
+        let keyboard = keyboardScalars(comparison)
+        let grams = ngramSet(targetScalars, n: options.ngramSize)
+        let intersection = query.grams.intersection(grams).count
+        let union = query.grams.count + grams.count - intersection
+        let jaccard = union == 0 ? 0 : Double(intersection) / Double(union)
+        let edit = try StringDistance.distance(query.scalars, targetScalars, algorithm: options.distanceAlgorithm,
+                                               cancellationCheck: cancellationCheck)
+        let jamoEdit = try StringDistance.distance(query.jamoScalars, jamoScalars, algorithm: options.distanceAlgorithm,
+                                                   cancellationCheck: cancellationCheck)
+        let keyboardDistance = try StringDistance.weightedDistance(query.keyboard, keyboard,
+                                                                   substitutionCost: keyboardSubstitutionCost,
+                                                                   cancellationCheck: cancellationCheck)
+        let editSimilarity = similarity(Double(edit), max(query.scalars.count, targetScalars.count))
+        let jamoSimilarity = similarity(Double(jamoEdit), max(query.jamoScalars.count, jamoScalars.count))
+        let keyboardSimilarity = similarity(keyboardDistance, max(query.keyboard.count, keyboard.count))
         let weights = options.weights
-        let weightSum = max(
-            0.000_001,
-            weights.editDistance + weights.jaccard + weights.keyboard + weights.jamo
-        )
-
-        let weightedCore = (
-            (editSimilarity * weights.editDistance) +
-            (jaccardStats.similarity * weights.jaccard) +
-            (keyboard.similarity * weights.keyboard) +
-            (jamoStats.similarity * weights.jamo)
-        ) / weightSum
-
-        let exactBonus = rhs == lhs ? weights.exactBonus : 0
-        let prefixBonus = (exactBonus == 0 && (rhs.hasPrefix(lhs) || choseongRHS.hasPrefix(choseongLHS)))
-            ? weights.prefixBonus
-            : 0
-
-        let total = min(1, max(0, weightedCore + exactBonus + prefixBonus))
+        let sum = weights.editDistance + weights.jaccard + weights.keyboard + weights.jamo
+        let core = ((editSimilarity * weights.editDistance) + (jaccard * weights.jaccard)
+                    + (keyboardSimilarity * weights.keyboard) + (jamoSimilarity * weights.jamo)) / max(0.000_001, sum)
+        let lhsComparison = query.choseongOnly ? query.choseong : query.text
+        let exact = comparison == lhsComparison
+        let exactBonus = exact ? weights.exactBonus : 0
+        let prefixBonus = !exact && comparison.hasPrefix(lhsComparison) ? weights.prefixBonus : 0
+        let total = query.scalars.isEmpty || targetScalars.isEmpty ? 0 : min(1, max(0, core + exactBonus + prefixBonus))
         let breakdown = SimilarityScoreBreakdown(
-            editDistanceSimilarity: editSimilarity,
-            jaccardSimilarity: jaccardStats.similarity,
-            keyboardSimilarity: keyboard.similarity,
-            jamoSimilarity: jamoStats.similarity,
-            weightedCoreScore: weightedCore,
-            prefixBonus: prefixBonus,
-            exactBonus: exactBonus,
-            totalScore: total
+            editDistanceSimilarity: editSimilarity, jaccardSimilarity: jaccard,
+            keyboardSimilarity: keyboardSimilarity, jamoSimilarity: jamoSimilarity,
+            weightedCoreScore: core, prefixBonus: prefixBonus, exactBonus: exactBonus, totalScore: total
         )
-
-        let detail = SimilarityExplanationDetail(
-            normalizedQuery: lhs,
-            normalizedTarget: rhs,
-            choseongQuery: choseongLHS,
-            choseongTarget: choseongRHS,
-            jamoQuery: jamoStats.queryJamo,
-            jamoTarget: jamoStats.targetJamo,
-            editDistance: editDistance,
-            jamoEditDistance: jamoStats.distance,
-            keyboardDistance: keyboard.distance,
-            jaccardIntersectionCount: jaccardStats.intersectionCount,
-            jaccardUnionCount: jaccardStats.unionCount
-        )
-
+        let detail: SimilarityExplanationDetail? = includeDetail ? .init(
+            normalizedQuery: query.text, normalizedTarget: rhs, choseongQuery: query.choseong, choseongTarget: onset,
+            jamoQuery: query.jamo, jamoTarget: targetJamo, editDistance: edit, jamoEditDistance: jamoEdit,
+            keyboardDistance: keyboardDistance, jaccardIntersectionCount: intersection, jaccardUnionCount: union
+        ) : nil
         return (breakdown, detail)
     }
 
-    static func coarseSimilarity(
-        query: String,
-        choseongQuery: String,
-        key: String,
-        choseongKey: String
-    ) -> Double {
-        let lhs = choseongQuery.isEmpty ? query : choseongQuery
-        let rhs = choseongQuery.isEmpty ? key : choseongKey
-        guard !lhs.isEmpty, !rhs.isEmpty else { return 0 }
+    struct CoarseQuery {
+        let scalars: Set<UnicodeScalar>
+        let count: Int
+        let first: UnicodeScalar?
 
-        let overlap = tokenOverlap(lhs, rhs)
-        if overlap == 0 {
-            return 0
+        init(_ text: String) {
+            scalars = Set(text.unicodeScalars)
+            count = text.unicodeScalars.count
+            first = text.unicodeScalars.first
         }
 
-        let maxLength = max(lhs.count, rhs.count)
-        let lengthScore = max(
-            0,
-            1 - (Double(abs(lhs.count - rhs.count)) / Double(max(1, maxLength)))
-        )
-
-        var score = (overlap * 0.65) + (lengthScore * 0.35)
-        if lhs.first == rhs.first {
-            score += 0.1
+        func score(_ text: String) -> Double {
+            let right = Set(text.unicodeScalars)
+            guard !scalars.isEmpty, !right.isEmpty else { return 0 }
+            let intersection = scalars.intersection(right).count
+            guard intersection > 0 else { return 0 }
+            let overlap = Double(intersection) / Double(scalars.count + right.count - intersection)
+            let rightCount = text.unicodeScalars.count
+            let length = 1 - Double(abs(count - rightCount)) / Double(max(count, rightCount))
+            return min(1, overlap * 0.65 + length * 0.35 + (first == text.unicodeScalars.first ? 0.1 : 0))
         }
-        return min(1, score)
     }
 
     private static func canonical(_ text: String) -> String {
         let normalized = text.precomposedStringWithCanonicalMapping.lowercased()
-        var scalars: [UnicodeScalar] = []
-        scalars.reserveCapacity(normalized.unicodeScalars.count)
-
-        for scalar in normalized.unicodeScalars where !scalar.properties.isWhitespace {
-            scalars.append(scalar)
-        }
-
-        return String(String.UnicodeScalarView(scalars))
+        return String(String.UnicodeScalarView(normalized.unicodeScalars.filter { !$0.properties.isWhitespace }))
     }
 
-    private static func jamoStats(_ lhs: String, _ rhs: String) -> (queryJamo: String, targetJamo: String, distance: Int, similarity: Double) {
-        let disassembleOptions = DisassembleOptions(
-            decomposeDoubleVowels: true,
-            decomposeDoubleFinals: true,
-            preserveNonHangul: false
-        )
-
-        let lhsJamo = Hangul.disassemble(lhs, options: disassembleOptions)
-        let rhsJamo = Hangul.disassemble(rhs, options: disassembleOptions)
-
-        if lhsJamo.isEmpty || rhsJamo.isEmpty {
-            let distance = levenshteinDistance(lhs, rhs)
-            let similarity = normalizedSimilarity(distance: distance, maxLength: max(lhs.count, rhs.count))
-            return (lhsJamo, rhsJamo, distance, similarity)
-        }
-
-        let distance = levenshteinDistance(lhsJamo, rhsJamo)
-        let similarity = normalizedSimilarity(distance: distance, maxLength: max(lhsJamo.count, rhsJamo.count))
-        return (lhsJamo, rhsJamo, distance, similarity)
-    }
-
-    private static func jaccardNgramSimilarity(_ lhs: String, _ rhs: String, n: Int) -> Double {
-        jaccardNgramStats(lhs, rhs, n: n).similarity
-    }
-
-    private static func jaccardNgramStats(_ lhs: String, _ rhs: String, n: Int) -> (similarity: Double, intersectionCount: Int, unionCount: Int) {
-        let left = ngramSet(lhs, n: n)
-        let right = ngramSet(rhs, n: n)
-        guard !left.isEmpty, !right.isEmpty else {
-            let equalityScore = lhs == rhs ? 1.0 : 0.0
-            return (equalityScore, lhs == rhs ? 1 : 0, lhs == rhs ? 1 : max(left.count, right.count))
-        }
-
-        let intersectionCount = left.intersection(right).count
-        let unionCount = left.union(right).count
-        guard unionCount > 0 else { return (0, 0, 0) }
-        let similarity = Double(intersectionCount) / Double(unionCount)
-        return (similarity, intersectionCount, unionCount)
-    }
-
-    private static func ngramSet(_ text: String, n: Int) -> Set<String> {
-        let scalars = Array(text.unicodeScalars)
+    private static func ngramSet(_ scalars: [UnicodeScalar], n: Int) -> Set<String> {
         guard !scalars.isEmpty else { return [] }
-
-        let size = max(1, n)
-        if scalars.count < size {
-            return [String(String.UnicodeScalarView(scalars))]
+        let size = min(scalars.count, max(1, n))
+        var result: Set<String> = []
+        result.reserveCapacity(scalars.count - size + 1)
+        for i in 0...(scalars.count - size) {
+            result.insert(String(String.UnicodeScalarView(scalars[i..<(i + size)])))
         }
-
-        var grams: Set<String> = []
-        grams.reserveCapacity(scalars.count - size + 1)
-
-        for start in 0...(scalars.count - size) {
-            let slice = scalars[start..<(start + size)]
-            grams.insert(String(String.UnicodeScalarView(slice)))
-        }
-
-        return grams
+        return result
     }
 
-    private static func normalizedLevenshteinSimilarity(_ lhs: String, _ rhs: String) -> Double {
-        let distance = levenshteinDistance(lhs, rhs)
-        return normalizedSimilarity(distance: distance, maxLength: max(lhs.count, rhs.count))
+    private static func similarity(_ distance: Double, _ length: Int) -> Double {
+        length == 0 ? 1 : max(0, 1 - distance / Double(length))
     }
 
-    private static func normalizedSimilarity(distance: Int, maxLength: Int) -> Double {
-        guard maxLength > 0 else { return 1 }
-        let normalizedDistance = Double(distance) / Double(maxLength)
-        return max(0, 1 - normalizedDistance)
-    }
-
-    private static func levenshteinDistance(_ lhs: String, _ rhs: String) -> Int {
-        let left = Array(lhs.unicodeScalars)
-        let right = Array(rhs.unicodeScalars)
-        guard !left.isEmpty, !right.isEmpty else {
-            return max(left.count, right.count)
-        }
-
-        if left == right {
-            return 0
-        }
-
-        var previous = Array(0...right.count)
-        var current = Array(repeating: 0, count: right.count + 1)
-
-        for i in 1...left.count {
-            current[0] = i
-            for j in 1...right.count {
-                let substitution = previous[j - 1] + (left[i - 1] == right[j - 1] ? 0 : 1)
-                let insertion = current[j - 1] + 1
-                let deletion = previous[j] + 1
-                current[j] = min(substitution, insertion, deletion)
-            }
-            swap(&previous, &current)
-        }
-
-        return previous[right.count]
-    }
-
-    private static func keyboardProximitySimilarity(_ lhs: String, _ rhs: String) -> Double {
-        keyboardProximityStats(lhs, rhs).similarity
-    }
-
-    private static func keyboardProximityStats(_ lhs: String, _ rhs: String) -> (distance: Double, similarity: Double) {
-        let left = qwertyComparableScalars(lhs)
-        let right = qwertyComparableScalars(rhs)
-        guard !left.isEmpty, !right.isEmpty else {
-            let distance = Double(max(lhs.count, rhs.count))
-            return (distance, lhs == rhs ? 1 : 0)
-        }
-
-        if left == right {
-            return (0, 1)
-        }
-
-        let insertionDeletionCost = 1.0
-        var previous = Array(repeating: 0.0, count: right.count + 1)
-        var current = Array(repeating: 0.0, count: right.count + 1)
-
-        for j in 0...right.count {
-            previous[j] = Double(j) * insertionDeletionCost
-        }
-
-        for i in 1...left.count {
-            current[0] = Double(i) * insertionDeletionCost
-            for j in 1...right.count {
-                let substitution = previous[j - 1] + keyboardSubstitutionCost(left[i - 1], right[j - 1])
-                let insertion = current[j - 1] + insertionDeletionCost
-                let deletion = previous[j] + insertionDeletionCost
-                current[j] = min(substitution, insertion, deletion)
-            }
-            swap(&previous, &current)
-        }
-
-        let maxLength = max(left.count, right.count)
-        let distance = previous[right.count]
-        let normalizedDistance = distance / Double(maxLength)
-        return (distance, max(0, 1 - normalizedDistance))
-    }
-
-    private static func qwertyComparableScalars(_ text: String) -> [UnicodeScalar] {
-        let qwerty = Hangul.convertHangulToQwerty(text).lowercased()
-        return qwerty.unicodeScalars.filter { qwertyPositions[$0] != nil }
+    private static func keyboardScalars(_ text: String) -> [UnicodeScalar] {
+        // Unknown keys remain literal characters instead of disappearing from the comparison.
+        Array(Hangul.convertHangulToQwerty(text).lowercased().unicodeScalars)
     }
 
     private static func keyboardSubstitutionCost(_ lhs: UnicodeScalar, _ rhs: UnicodeScalar) -> Double {
-        if lhs == rhs {
-            return 0
-        }
-
-        guard let left = qwertyPositions[lhs], let right = qwertyPositions[rhs] else {
-            return 1
-        }
-
+        if lhs == rhs { return 0 }
+        guard let left = qwertyPositions[lhs], let right = qwertyPositions[rhs] else { return 1 }
         let distance = abs(left.x - right.x) + abs(left.y - right.y)
-        if distance <= 1 {
-            return 0.35
-        }
-        if distance <= 2 {
-            return 0.65
-        }
-        return 1
+        return distance <= 1 ? 0.35 : (distance <= 2 ? 0.65 : 1)
     }
 
-    private struct KeyPoint {
+    private struct KeyPoint: Sendable {
         let x: Double
         let y: Double
     }
 
-    private static func tokenOverlap(_ lhs: String, _ rhs: String) -> Double {
-        let leftSet = Set(lhs.unicodeScalars)
-        let rightSet = Set(rhs.unicodeScalars)
-        guard !leftSet.isEmpty, !rightSet.isEmpty else { return 0 }
-
-        let intersection = leftSet.intersection(rightSet).count
-        let union = leftSet.union(rightSet).count
-        guard union > 0 else { return 0 }
-        return Double(intersection) / Double(union)
-    }
-
     private static let qwertyPositions: [UnicodeScalar: KeyPoint] = {
         var result: [UnicodeScalar: KeyPoint] = [:]
-
-        let rows: [(row: String, offset: Double)] = [
-            ("1234567890", 0.0),
-            ("qwertyuiop", 0.2),
-            ("asdfghjkl", 0.6),
-            ("zxcvbnm", 1.1),
-        ]
-
-        for (rowIndex, rowInfo) in rows.enumerated() {
-            for (columnIndex, scalar) in rowInfo.row.unicodeScalars.enumerated() {
-                result[scalar] = KeyPoint(x: Double(columnIndex) + rowInfo.offset, y: Double(rowIndex))
+        for (rowIndex, row) in [("1234567890", 0.0), ("qwertyuiop", 0.2), ("asdfghjkl", 0.6), ("zxcvbnm", 1.1)].enumerated() {
+            for (column, scalar) in row.0.unicodeScalars.enumerated() {
+                result[scalar] = KeyPoint(x: Double(column) + row.1, y: Double(rowIndex))
             }
         }
-
         return result
     }()
 }

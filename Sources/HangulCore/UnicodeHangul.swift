@@ -2,6 +2,20 @@ import Foundation
 
 @usableFromInline
 internal enum UnicodeHangul {
+    static func compatibilityJamo(_ scalar: UnicodeScalar) -> String? {
+        switch scalar.value {
+        case 0x3131...0x3163: return String(scalar)
+        case 0x1100...0x1112: return JamoTables.choseong[Int(scalar.value - 0x1100)]
+        case 0x1161...0x1175: return JamoTables.jungseong[Int(scalar.value - 0x1161)]
+        case 0x11A8...0x11C2: return JamoTables.jongseong[Int(scalar.value - 0x11A7)]
+        case 0xFFA1...0xFFDC:
+            let normalized = String(scalar).precomposedStringWithCompatibilityMapping
+            guard let mapped = normalized.unicodeScalars.first, mapped != scalar else { return nil }
+            return compatibilityJamo(mapped)
+        default: return nil
+        }
+    }
+
     @usableFromInline static let sBase: UInt32 = 0xAC00
     @usableFromInline static let lCount: UInt32 = 19
     @usableFromInline static let vCount: UInt32 = 21

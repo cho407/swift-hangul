@@ -187,6 +187,8 @@ public actor SimilarityFeedbackStore {
         maxSamples: Int = 5_000,
         minOccurrences: Int = 1
     ) -> [SimilarityTrainingSample] {
+        guard maxSamples > 0 else { return [] }
+        let maxSamples = min(50_000, maxSamples)
         let pairStats = buildPairStats(events: events, maxPairs: maxSamples * 2)
         guard !pairStats.isEmpty else { return [] }
 
